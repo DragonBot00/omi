@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
+import 'package:meta/meta.dart';
 
 import 'package:omi/backend/preferences.dart';
 import 'package:omi/models/sync_state.dart';
@@ -39,6 +40,15 @@ class LocalWalSyncImpl implements LocalWalSync {
   SyncLocalFilesResponse? get accumulatedResponse => _accumulatedResponse;
 
   LocalWalSyncImpl(this.listener);
+
+  @visibleForTesting
+  List<WalFrame> get testFrames => _frames;
+
+  @visibleForTesting
+  List<bool> get testFrameSynced => _frameSynced;
+
+  @visibleForTesting
+  List<Wal> get testWals => _wals;
 
   @override
   void cancelSync() {
