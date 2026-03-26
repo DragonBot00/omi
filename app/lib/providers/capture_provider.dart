@@ -720,8 +720,8 @@ class CaptureProvider extends ChangeNotifier
   }
 
   Future _cleanupCurrentState() async {
-    _activeSource = null;
     await _closeBleStream();
+    _activeSource = null;
     notifyListeners();
   }
 
