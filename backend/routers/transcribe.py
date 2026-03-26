@@ -73,6 +73,8 @@ from utils.pusher import connect_to_trigger_pusher, PusherCircuitBreakerOpen, ge
 from utils.speaker_identification import detect_speaker_from_text
 from utils.stt.streaming import (
     STTService,
+    calculate_backoff_with_jitter,
+    get_deepgram_circuit_breaker,
     get_stt_service_for_language,
     process_audio_dg,
 )
@@ -922,6 +924,8 @@ async def _stream_handler(
 
     # Process STT
     deepgram_socket = None
+    deepgram_recovery_task = None
+    stt_degraded = False
 
     vad_gate = None
 
@@ -929,6 +933,105 @@ async def _stream_handler(
         nonlocal realtime_segment_buffers
         # Note: DG timestamp remapping is handled inside GatedDeepgramSocket wrapper
         realtime_segment_buffers.extend(segments)
+
+    def make_multi_channel_callback(cfg):
+        def cb(segments):
+            for seg in segments:
+                seg['is_user'] = cfg.is_user
+                seg['speaker'] = cfg.speaker_label
+            realtime_segment_buffers.extend(segments)
+
+        return cb
+
+    def _send_stt_degraded_event(reason: str):
+        nonlocal stt_degraded
+        if stt_degraded:
+            return
+        stt_degraded = True
+        _send_message_event(MessageServiceStatusEvent(status="stt_degraded", status_text=reason))
+
+    def _send_stt_recovered_event():
+        nonlocal stt_degraded
+        if not stt_degraded:
+            return
+        stt_degraded = False
+        _send_message_event(MessageServiceStatusEvent(status="stt_recovered", status_text="STT Service Restored"))
+
+    async def _recover_deepgram_connection():
+        nonlocal deepgram_socket
+        nonlocal deepgram_recovery_task
+        attempt = 0
+
+        while websocket_active:
+            if is_multi_channel:
+                missing_indices = [i for i, sock in enumerate(stt_sockets_multi) if sock is None]
+                if len(missing_indices) == 0:
+                    _send_stt_recovered_event()
+                    return
+            elif deepgram_socket is not None:
+                _send_stt_recovered_event()
+                return
+
+            attempt += 1
+            if attempt > 1:
+                backoff_delay = calculate_backoff_with_jitter(attempt - 1)
+                await asyncio.sleep(backoff_delay / 1000.0)
+
+            try:
+                if is_multi_channel:
+                    for i in [idx for idx, sock in enumerate(stt_sockets_multi) if sock is None]:
+                        callback = make_multi_channel_callback(channel_configs[i])
+                        stt_sockets_multi[i] = await process_audio_dg(
+                            callback,
+                            stt_language,
+                            TARGET_SAMPLE_RATE,
+                            1,
+                            model=stt_model,
+                            is_active=lambda: websocket_active,
+                        )
+                    if all(sock is not None for sock in stt_sockets_multi):
+                        logger.info(f"Recovered all multi-channel Deepgram sockets {uid} {session_id}")
+                        _send_stt_recovered_event()
+                        return
+                else:
+                    deepgram_socket = await process_audio_dg(
+                        stream_transcript,
+                        stt_language,
+                        sample_rate,
+                        1,
+                        model=stt_model,
+                        keywords=vocabulary[:100] if vocabulary else None,
+                        vad_gate=vad_gate,
+                        is_active=lambda: websocket_active,
+                    )
+                    if deepgram_socket is not None:
+                        # Activate VAD gate if it was left in shadow mode
+                        if (
+                            vad_gate is not None
+                            and (VAD_GATE_MODE == 'active' or vad_gate_override == 'enabled')
+                            and vad_gate.mode == 'shadow'
+                        ):
+                            vad_gate.activate()
+                            logger.info('VAD gate activated after DG recovery uid=%s session=%s', uid, session_id)
+                        logger.info(f"Recovered Deepgram socket {uid} {session_id}")
+                        _send_stt_recovered_event()
+                        return
+            except Exception as e:
+                logger.error(f"Deepgram recovery attempt failed: {e} {uid} {session_id}")
+
+        deepgram_recovery_task = None
+
+    async def _enter_degraded_mode(reason: str):
+        nonlocal deepgram_recovery_task
+
+        cb = get_deepgram_circuit_breaker()
+        if cb.is_open():
+            logger.warning(f"Deepgram circuit breaker OPEN {cb.snapshot()} {uid} {session_id}")
+
+        _send_stt_degraded_event(reason)
+
+        if deepgram_recovery_task is None or deepgram_recovery_task.done():
+            deepgram_recovery_task = spawn(_recover_deepgram_connection())
 
     async def _process_stt():
         nonlocal websocket_close_code
@@ -941,16 +1044,6 @@ async def _stream_handler(
             if is_multi_channel:
                 # Create one STT connection per channel
                 for i, ch_config in enumerate(channel_configs):
-
-                    def make_multi_channel_callback(cfg):
-                        def cb(segments):
-                            for seg in segments:
-                                seg['is_user'] = cfg.is_user
-                                seg['speaker'] = cfg.speaker_label
-                            realtime_segment_buffers.extend(segments)
-
-                        return cb
-
                     callback = make_multi_channel_callback(ch_config)
                     stt_sockets_multi[i] = await process_audio_dg(
                         callback,
@@ -959,6 +1052,8 @@ async def _stream_handler(
                         1,
                         model=stt_model,
                     )
+                if any(sock is None for sock in stt_sockets_multi):
+                    await _enter_degraded_mode("STT degraded: reconnecting to Deepgram")
                 logger.info(
                     f"Multi-channel STT connections established ({len(channel_configs)} channels) {uid} {session_id}"
                 )
@@ -1004,12 +1099,14 @@ async def _stream_handler(
                 vad_gate=vad_gate,
                 is_active=lambda: websocket_active,
             )
+            if deepgram_socket is None:
+                await _enter_degraded_mode("STT degraded: reconnecting to Deepgram")
+                return None
             return None
 
         except Exception as e:
             logger.error(f"Initial processing error: {e} {uid} {session_id}")
-            websocket_close_code = 1011
-            await websocket.close(code=websocket_close_code)
+            await _enter_degraded_mode("STT degraded: reconnecting to Deepgram")
             return None
 
     # Pusher
@@ -2410,10 +2507,11 @@ async def _stream_handler(
     elif codec == 'lc3':
         lc3_decoder = lc3.Decoder(lc3_frame_duration_us, sample_rate)
 
-    async def receive_data(dg_socket):
+    async def receive_data():
         nonlocal websocket_active, websocket_close_code, last_audio_received_time, last_activity_time, current_conversation_id
         nonlocal realtime_photo_buffers, speaker_to_person_map, first_audio_byte_timestamp, last_usage_record_timestamp
         nonlocal audio_ring_buffer, dg_usage_ms_pending
+        dg_socket = deepgram_socket  # Local alias; updated by flush_stt_buffer on recovery
         timer_start = time.time()
         last_audio_received_time = timer_start
         last_activity_time = timer_start
@@ -2423,7 +2521,7 @@ async def _stream_handler(
         stt_buffer_flush_size = int(sample_rate * 2 * 0.03)  # 30ms at 16-bit mono (e.g., 6400 bytes at 16kHz)
 
         async def flush_stt_buffer(force: bool = False):
-            nonlocal stt_audio_buffer, dg_usage_ms_pending, dg_socket
+            nonlocal stt_audio_buffer, dg_usage_ms_pending, dg_socket, deepgram_socket
 
             if not stt_audio_buffer:
                 return
@@ -2443,13 +2541,26 @@ async def _stream_handler(
                     close_reason,
                 )
                 dg_socket = None  # Stop sending to dead connection
+                deepgram_socket = None  # Sync outer scope for recovery task
+                await _enter_degraded_mode("STT degraded: DG connection died")
+
+            # Pick up recovered DG socket from background recovery task
+            if dg_socket is None and deepgram_socket is not None:
+                dg_socket = deepgram_socket
 
             if dg_socket is not None:
                 # DG budget gate: skip sending if daily budget is exhausted (#5746, #6083)
                 if fair_use_dg_budget_exhausted:
                     pass  # Audio not forwarded to DG — budget/credits exhausted
                 else:
-                    dg_socket.send(chunk)
+                    try:
+                        dg_socket.send(chunk)
+                    except Exception as e:
+                        logger.error(f"Deepgram send failed, entering degraded mode: {e} {uid} {session_id}")
+                        dg_socket = None
+                        deepgram_socket = None  # Sync outer scope for recovery task
+                        await _enter_degraded_mode("STT degraded: reconnecting to Deepgram")
+                        return
                     # Accumulate DG usage locally, flushed every 60s (#5854)
                     if fair_use_track_dg_usage:
                         chunk_ms = len(chunk) * 1000 // (sample_rate * 2)  # 16-bit mono
@@ -2718,7 +2829,7 @@ async def _stream_handler(
             pusher_tasks.append(asyncio.create_task(pusher_heartbeat()))
 
         # Tasks
-        data_process_task = asyncio.create_task(receive_data(deepgram_socket))
+        data_process_task = asyncio.create_task(receive_data())
         stream_transcript_task = asyncio.create_task(stream_transcript_process())
         record_usage_task = asyncio.create_task(_record_usage_periodically())
 
