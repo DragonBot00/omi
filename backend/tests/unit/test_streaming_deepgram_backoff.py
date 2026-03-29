@@ -1177,3 +1177,42 @@ async def test_circuit_breaker_half_open_probe_fails_via_backoff():
             )
 
     assert cb._state == "open"
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_half_open_probe_stops_retries_on_failure():
+    """Half-open probe failure aborts remaining retries (no thundering herd)."""
+    cb = get_deepgram_circuit_breaker()
+    cb.failure_threshold = 1
+    cb.reset_timeout_seconds = 1.0
+    cb.record_failure(Exception("open"))
+    cb._opened_at_monotonic = time.monotonic() - 2.0
+
+    call_count = 0
+
+    def counting_fail(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        raise Exception("probe fail")
+
+    async def fake_sleep(duration):
+        pass
+
+    with patch('utils.stt.streaming.connect_to_deepgram', side_effect=counting_fail), patch(
+        'utils.stt.streaming.asyncio.sleep', side_effect=fake_sleep
+    ):
+        result = await connect_to_deepgram_with_backoff(
+            on_message=MagicMock(),
+            on_error=MagicMock(),
+            language='en',
+            sample_rate=16000,
+            channels=1,
+            model='nova-2-general',
+            retries=3,
+        )
+
+    # Only 1 attempt should have been made — the half-open probe.
+    # After it fails, CB reopens and allow_request returns False, aborting retries.
+    assert call_count == 1
+    assert result is None
+    assert cb._state == "open"
