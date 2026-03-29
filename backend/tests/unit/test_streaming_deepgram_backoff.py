@@ -1216,3 +1216,66 @@ async def test_circuit_breaker_half_open_probe_stops_retries_on_failure():
     assert call_count == 1
     assert result is None
     assert cb._state == "open"
+
+
+# ---------------------------------------------------------------------------
+# Boundary condition tests
+# ---------------------------------------------------------------------------
+
+
+def test_circuit_breaker_below_threshold_stays_closed():
+    """One failure below threshold does not open the circuit breaker."""
+    cb = get_deepgram_circuit_breaker()
+    cb.failure_threshold = 3
+    cb.record_failure(Exception("fail 1"))
+    assert cb._state == "closed"
+    assert cb._consecutive_failures == 1
+    assert cb.allow_request() is True
+
+    cb.record_failure(Exception("fail 2"))
+    assert cb._state == "closed"
+    assert cb._consecutive_failures == 2
+    assert cb.allow_request() is True
+
+
+def test_circuit_breaker_exact_threshold_opens():
+    """Exactly failure_threshold failures opens the circuit breaker."""
+    cb = get_deepgram_circuit_breaker()
+    cb.failure_threshold = 3
+    cb.record_failure(Exception("fail 1"))
+    cb.record_failure(Exception("fail 2"))
+    assert cb._state == "closed"
+    cb.record_failure(Exception("fail 3"))
+    assert cb._state == "open"
+    assert cb.is_open() is True
+
+
+def test_circuit_breaker_exact_timeout_boundary():
+    """At exactly reset_timeout_seconds, CB transitions to half_open."""
+    cb = get_deepgram_circuit_breaker()
+    cb.failure_threshold = 1
+    cb.reset_timeout_seconds = 10.0
+    cb.record_failure(Exception("open"))
+
+    # Set opened_at to exactly timeout ago
+    cb._opened_at_monotonic = time.monotonic() - 10.0
+
+    # is_open should return False (timeout elapsed, will allow probe)
+    assert cb.is_open() is False
+    # allow_request should transition to half_open
+    assert cb.allow_request() is True
+    assert cb._state == "half_open"
+
+
+def test_circuit_breaker_just_before_timeout_stays_open():
+    """Just before reset_timeout_seconds, CB stays open."""
+    cb = get_deepgram_circuit_breaker()
+    cb.failure_threshold = 1
+    cb.reset_timeout_seconds = 10.0
+    cb.record_failure(Exception("open"))
+
+    # Set opened_at to just before timeout
+    cb._opened_at_monotonic = time.monotonic() - 9.999
+
+    assert cb.is_open() is True
+    assert cb.allow_request() is False
