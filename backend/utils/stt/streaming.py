@@ -191,7 +191,10 @@ class DeepgramCircuitBreaker:
         with self._lock:
             if self._state == "open":
                 # Check timeout — if elapsed, it would transition to half_open on next allow_request
-                if self._opened_at_monotonic is not None and time.monotonic() - self._opened_at_monotonic >= self.reset_timeout_seconds:
+                if (
+                    self._opened_at_monotonic is not None
+                    and time.monotonic() - self._opened_at_monotonic >= self.reset_timeout_seconds
+                ):
                     return False  # Timeout elapsed, will allow probe
                 return True
             return False
@@ -398,6 +401,10 @@ async def connect_to_deepgram_with_backoff(
             deepgram_circuit_breaker.record_failure(error)
             if attempt == retries - 1:  # Last attempt
                 raise
+            # Re-check CB after failure — if half-open probe failed, CB reopened; stop retrying
+            if not deepgram_circuit_breaker.allow_request():
+                logger.warning("Deepgram circuit breaker reopened after probe failure, aborting retries")
+                return None
         backoff_delay = calculate_backoff_with_jitter(attempt)
         logger.warning(f"Waiting {backoff_delay:.0f}ms before next retry...")
         await asyncio.sleep(backoff_delay / 1000)  # Convert ms to seconds for sleep
