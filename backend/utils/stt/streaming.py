@@ -138,9 +138,14 @@ class DeepgramCircuitBreaker:
 
     def allow_request(self) -> bool:
         with self._lock:
-            if self._state != "open":
+            if self._state == "closed":
                 return True
 
+            if self._state == "half_open":
+                # Only one probe allowed in half-open; reject others
+                return False
+
+            # state == "open"
             now = time.monotonic()
             if self._opened_at_monotonic is None:
                 self._state = "closed"
@@ -148,18 +153,16 @@ class DeepgramCircuitBreaker:
                 return True
 
             if now - self._opened_at_monotonic >= self.reset_timeout_seconds:
-                self._state = "closed"
-                self._consecutive_failures = 0
-                self._opened_at_monotonic = None
-                logger.info("DeepgramCircuitBreaker moved to CLOSED after timeout")
+                self._state = "half_open"
+                logger.info("DeepgramCircuitBreaker moved to HALF_OPEN after timeout (single probe allowed)")
                 return True
 
             return False
 
     def record_success(self):
         with self._lock:
-            if self._state == "open" or self._consecutive_failures > 0:
-                logger.info("DeepgramCircuitBreaker recorded success and reset to CLOSED")
+            if self._state in ("open", "half_open") or self._consecutive_failures > 0:
+                logger.info("DeepgramCircuitBreaker recorded success and reset to CLOSED (was %s)", self._state)
             self._state = "closed"
             self._consecutive_failures = 0
             self._opened_at_monotonic = None
@@ -167,7 +170,15 @@ class DeepgramCircuitBreaker:
     def record_failure(self, error: Optional[Exception] = None):
         with self._lock:
             self._consecutive_failures += 1
-            if self._consecutive_failures >= self.failure_threshold:
+            if self._state == "half_open":
+                # Probe failed — back to open with fresh timer
+                self._state = "open"
+                self._opened_at_monotonic = time.monotonic()
+                logger.warning(
+                    "DeepgramCircuitBreaker half-open probe FAILED, back to OPEN. error=%s",
+                    error,
+                )
+            elif self._consecutive_failures >= self.failure_threshold:
                 self._state = "open"
                 self._opened_at_monotonic = time.monotonic()
                 logger.warning(
@@ -178,7 +189,12 @@ class DeepgramCircuitBreaker:
 
     def is_open(self) -> bool:
         with self._lock:
-            return self._state == "open"
+            if self._state == "open":
+                # Check timeout — if elapsed, it would transition to half_open on next allow_request
+                if self._opened_at_monotonic is not None and time.monotonic() - self._opened_at_monotonic >= self.reset_timeout_seconds:
+                    return False  # Timeout elapsed, will allow probe
+                return True
+            return False
 
     def snapshot(self) -> dict:
         with self._lock:
