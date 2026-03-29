@@ -31,10 +31,13 @@ for mod_name in [
         _mock_modules[mod_name] = MagicMock()
         sys.modules[mod_name] = _mock_modules[mod_name]
 
-sys.modules['deepgram'].DeepgramClient = MagicMock
-sys.modules['deepgram'].DeepgramClientOptions = MagicMock
-sys.modules['deepgram'].LiveTranscriptionEvents = MagicMock()
-sys.modules['deepgram.clients.live.v1'].LiveOptions = MagicMock
+# Only set attributes if not already set by another test file (avoids cross-test contamination)
+if not hasattr(sys.modules['deepgram'], '_mock_initialized'):
+    sys.modules['deepgram'].DeepgramClient = MagicMock
+    sys.modules['deepgram'].DeepgramClientOptions = MagicMock
+    sys.modules['deepgram'].LiveTranscriptionEvents = MagicMock()
+    sys.modules['deepgram.clients.live.v1'].LiveOptions = MagicMock
+    sys.modules['deepgram']._mock_initialized = True
 
 from utils.stt.streaming import (
     get_deepgram_circuit_breaker,
