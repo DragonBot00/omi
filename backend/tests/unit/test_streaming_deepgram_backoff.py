@@ -1033,7 +1033,8 @@ async def test_circuit_breaker_allows_connect_after_timeout_window():
     cb.reset_timeout_seconds = 1.0
     cb.record_failure(Exception("open"))
     cb._opened_at_monotonic = time.monotonic() - 2.0
-    assert cb.is_open() is True
+    # After timeout elapsed, is_open() returns False (will transition to half_open on allow_request)
+    assert cb.is_open() is False
 
     mock_conn = MagicMock()
     with patch('utils.stt.streaming.connect_to_deepgram', return_value=mock_conn):
@@ -1049,3 +1050,130 @@ async def test_circuit_breaker_allows_connect_after_timeout_window():
 
     assert result is mock_conn
     assert cb.is_open() is False
+
+
+# ---------------------------------------------------------------------------
+# Half-open circuit breaker state tests
+# ---------------------------------------------------------------------------
+
+
+def test_circuit_breaker_half_open_single_probe():
+    """After timeout, CB moves to half_open and allows exactly one probe request."""
+    cb = get_deepgram_circuit_breaker()
+    cb.failure_threshold = 1
+    cb.reset_timeout_seconds = 1.0
+    cb.record_failure(Exception("open"))
+    assert cb.is_open() is True
+
+    # Simulate timeout elapsed
+    cb._opened_at_monotonic = time.monotonic() - 2.0
+
+    # First call should be allowed (transitions to half_open)
+    assert cb.allow_request() is True
+    # Second call should be rejected (already in half_open, only one probe)
+    assert cb.allow_request() is False
+
+
+def test_circuit_breaker_half_open_success_closes():
+    """Successful probe in half_open state closes the circuit breaker."""
+    cb = get_deepgram_circuit_breaker()
+    cb.failure_threshold = 1
+    cb.reset_timeout_seconds = 1.0
+    cb.record_failure(Exception("open"))
+    cb._opened_at_monotonic = time.monotonic() - 2.0
+
+    # Transition to half_open via allow_request
+    assert cb.allow_request() is True
+    # Probe succeeds
+    cb.record_success()
+    assert cb._state == "closed"
+    assert cb._consecutive_failures == 0
+    # Now fully open for requests
+    assert cb.allow_request() is True
+
+
+def test_circuit_breaker_half_open_failure_reopens():
+    """Failed probe in half_open state reopens the circuit breaker with fresh timer."""
+    cb = get_deepgram_circuit_breaker()
+    cb.failure_threshold = 1
+    cb.reset_timeout_seconds = 1.0
+    cb.record_failure(Exception("open"))
+    cb._opened_at_monotonic = time.monotonic() - 2.0
+
+    # Transition to half_open
+    assert cb.allow_request() is True
+    # Probe fails
+    before_reopen = time.monotonic()
+    cb.record_failure(Exception("probe failed"))
+    assert cb._state == "open"
+    # Fresh timer should be set (not the old one)
+    assert cb._opened_at_monotonic >= before_reopen
+    # Should be open again
+    assert cb.is_open() is True
+
+
+def test_circuit_breaker_snapshot_includes_state():
+    """snapshot() returns current state including half_open."""
+    cb = get_deepgram_circuit_breaker()
+    snap = cb.snapshot()
+    assert snap["state"] == "closed"
+    assert snap["consecutive_failures"] == 0
+
+    cb.failure_threshold = 1
+    cb.record_failure(Exception("fail"))
+    snap = cb.snapshot()
+    assert snap["state"] == "open"
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_half_open_probe_via_backoff():
+    """Full integration: CB opens, timeout elapses, half_open probe succeeds via connect_to_deepgram_with_backoff."""
+    cb = get_deepgram_circuit_breaker()
+    cb.failure_threshold = 1
+    cb.reset_timeout_seconds = 1.0
+    cb.record_failure(Exception("open"))
+    cb._opened_at_monotonic = time.monotonic() - 2.0
+
+    mock_conn = MagicMock()
+    with patch('utils.stt.streaming.connect_to_deepgram', return_value=mock_conn):
+        result = await connect_to_deepgram_with_backoff(
+            on_message=MagicMock(),
+            on_error=MagicMock(),
+            language='en',
+            sample_rate=16000,
+            channels=1,
+            model='nova-2-general',
+            retries=1,
+        )
+
+    assert result is mock_conn
+    assert cb._state == "closed"
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_half_open_probe_fails_via_backoff():
+    """Full integration: CB opens, timeout elapses, half_open probe fails, CB reopens."""
+    cb = get_deepgram_circuit_breaker()
+    cb.failure_threshold = 1
+    cb.reset_timeout_seconds = 1.0
+    cb.record_failure(Exception("open"))
+    cb._opened_at_monotonic = time.monotonic() - 2.0
+
+    async def fake_sleep(duration):
+        pass
+
+    with patch('utils.stt.streaming.connect_to_deepgram', side_effect=Exception("probe fail")), patch(
+        'utils.stt.streaming.asyncio.sleep', side_effect=fake_sleep
+    ):
+        with pytest.raises(Exception, match="probe fail"):
+            await connect_to_deepgram_with_backoff(
+                on_message=MagicMock(),
+                on_error=MagicMock(),
+                language='en',
+                sample_rate=16000,
+                channels=1,
+                model='nova-2-general',
+                retries=1,
+            )
+
+    assert cb._state == "open"
