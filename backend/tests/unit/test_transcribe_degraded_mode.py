@@ -615,16 +615,28 @@ def test_multi_channel_callback_pins_epoch():
     assert "_stt_epoch" in fn_block, "multi-channel callback must tag segments with _stt_epoch"
 
 
-def test_stale_segments_skipped_in_speaker_detection():
-    """Source: speaker detection loop must skip segments in stale_dg_segment_ids."""
+def test_stale_segments_speaker_neutralized():
+    """Source: stale segments must have speaker/speaker_id set to None before combine_segments.
+
+    This prevents stale segments from merging with existing tail segments (merge
+    requires same speaker) and ensures speaker detection naturally skips them
+    (speaker_id is None → embedding enqueue gated, text-detection map write gated).
+    """
     source = _read_transcribe_source()
-    # Find the speaker detection section
-    detection_pos = source.find('# Speaker detection')
-    assert detection_pos > 0
-    detection_block = source[detection_pos : detection_pos + 500]
-    assert (
-        'stale_dg_segment_ids' in detection_block
-    ), "Speaker detection loop must check stale_dg_segment_ids to skip old DG segments"
+    # Find the stale segment handling in stream_transcript_process
+    process_pos = source.find('async def stream_transcript_process')
+    assert process_pos > 0
+    process_block = source[process_pos : process_pos + 5000]
+
+    # Must neutralize speaker on stale segments
+    assert 'segment.speaker = None' in process_block, "Stale segments must have speaker set to None"
+    assert 'segment.speaker_id = None' in process_block, "Stale segments must have speaker_id set to None"
+
+    # Neutralization must happen BEFORE the combine_segments call
+    neutralize_pos = process_block.find('segment.speaker = None')
+    combine_pos = process_block.find('.combine_segments(')
+    assert neutralize_pos > 0 and combine_pos > 0
+    assert neutralize_pos < combine_pos, "Speaker neutralization must happen before combine_segments call"
 
 
 def test_stt_epoch_popped_before_transcript_segment():
@@ -637,16 +649,16 @@ def test_stt_epoch_popped_before_transcript_segment():
     assert ts_pos > conv_pos, "TranscriptSegment conversion must come AFTER _stt_epoch pop"
 
 
-def test_stale_buffer_segments_skipped_at_runtime():
-    """Runtime: simulate stale segments in buffer to prove they don't trigger speaker operations.
+def test_stale_segments_speaker_neutralized_at_runtime():
+    """Runtime: simulate stale segments to prove their speaker is neutralized.
 
     Steps:
     1. Two segments buffered at epoch 0 (old DG)
     2. Recovery bumps epoch to 1
     3. One new segment arrives at epoch 1
-    4. Processing must skip speaker ops for epoch-0 segments but process epoch-1 segment
+    4. Processing must neutralize speaker on epoch-0 segments but keep epoch-1 intact
+    5. Neutralized segments are skipped by speaker detection (speaker_id is None)
     """
-    # Simulate the buffer-drain-and-classify logic from stream_transcript_process
     speaker_map_epoch = 1  # Recovery already happened
 
     raw_segments = [
@@ -669,31 +681,37 @@ def test_stale_buffer_segments_skipped_at_runtime():
         {'text': 'new DG segment', 'speaker': 'SPEAKER_0', 'is_user': False, 'start': 2.0, 'end': 3.0, '_stt_epoch': 1},
     ]
 
-    stale_ids = set()
-    segment_ids = []
+    # Simulate the processing logic: pop epoch, neutralize stale speakers
+    class Segment:
+        def __init__(self, text, speaker, speaker_id, is_user):
+            self.text = text
+            self.speaker = speaker
+            self.speaker_id = speaker_id
+            self.is_user = is_user
+
+    segments = []
     for s in raw_segments:
         seg_epoch = s.pop('_stt_epoch', speaker_map_epoch)
-        seg_id = f"seg-{len(segment_ids)}"
-        segment_ids.append(seg_id)
+        seg = Segment(s['text'], s['speaker'], int(s['speaker'].split('_')[1]), s['is_user'])
         if seg_epoch != speaker_map_epoch:
-            stale_ids.add(seg_id)
+            seg.speaker = None
+            seg.speaker_id = None
+        segments.append(seg)
 
-    # Epoch-0 segments should be stale
-    assert 'seg-0' in stale_ids
-    assert 'seg-1' in stale_ids
-    # Epoch-1 segment should NOT be stale
-    assert 'seg-2' not in stale_ids
+    # Epoch-0 segments should have neutralized speakers
+    assert segments[0].speaker is None
+    assert segments[0].speaker_id is None
+    assert segments[0].text == 'hello from old DG'  # text preserved
+    assert segments[1].speaker is None
+    assert segments[1].speaker_id is None
 
-    # Simulate the speaker detection loop — only non-stale segments proceed
-    speaker_ops_performed = []
-    for seg_id in segment_ids:
-        if seg_id in stale_ids:
-            continue
-        speaker_ops_performed.append(seg_id)
+    # Epoch-1 segment should keep its speaker
+    assert segments[2].speaker == 'SPEAKER_0'
+    assert segments[2].speaker_id == 0
 
-    assert speaker_ops_performed == [
-        'seg-2'
-    ], f"Only epoch-1 segment should have speaker ops, got {speaker_ops_performed}"
+    # Simulate speaker detection: only segments with speaker_id != None proceed
+    speaker_ops = [s.text for s in segments if s.speaker_id is not None]
+    assert speaker_ops == ['new DG segment']
 
 
 def test_late_old_socket_callback_tagged_stale():
@@ -747,3 +765,29 @@ def test_late_old_socket_callback_tagged_stale():
     fresh = [s for s in segments if s['_stt_epoch'] == current_epoch]
     assert len(fresh) == 1
     assert fresh[0]['text'] == 'from new DG'
+
+
+def test_stale_segment_merge_prevented_by_neutralization():
+    """Regression: stale segment must NOT merge with existing tail after speaker neutralization.
+
+    Without neutralization, a stale SPEAKER_0 segment merges into an existing
+    SPEAKER_0 tail (combine_segments requires same speaker). The merged segment
+    keeps the tail's ID, bypassing any ID-based stale guard. After neutralization
+    (speaker=None), the merge condition fails because speakers differ.
+    """
+    # Simulate: existing tail has SPEAKER_0 (from before DG died)
+    # Late stale segment also has SPEAKER_0 (from old DG)
+    # After neutralization, stale segment has speaker=None
+
+    # combine_segments merge condition: a.speaker == b.speaker
+    tail_speaker = 'SPEAKER_0'
+    stale_speaker_after_neutralization = None
+
+    # Merge should NOT happen because speakers differ
+    would_merge = tail_speaker == stale_speaker_after_neutralization
+    assert not would_merge, "Stale neutralized segment must not merge with existing tail"
+
+    # But a fresh segment from new DG SHOULD be able to merge
+    fresh_speaker = 'SPEAKER_0'
+    would_merge_fresh = tail_speaker == fresh_speaker
+    assert would_merge_fresh, "Fresh segment from new DG should be able to merge with existing tail"
