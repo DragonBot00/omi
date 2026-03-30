@@ -575,22 +575,43 @@ def test_epoch_guard_discards_stale_match_runtime():
 # ---------------------------------------------------------------------------
 
 
-def test_stream_transcript_tags_segments_with_epoch():
-    """Source: stream_transcript must tag each segment dict with _stt_epoch."""
+def test_dg_callback_pins_epoch_at_creation():
+    """Source: _make_dg_transcript_callback must capture epoch at creation time (not at callback time).
+
+    This ensures old DG sockets that fire late callbacks tag segments with the
+    OLD epoch, not the current one — so they are correctly identified as stale.
+    """
     source = _read_transcribe_source()
-    fn_pos = source.find('def stream_transcript(segments)')
+    fn_pos = source.find('def _make_dg_transcript_callback')
     assert fn_pos > 0
-    fn_block = source[fn_pos : fn_pos + 500]
-    assert "_stt_epoch" in fn_block, "stream_transcript must tag segments with _stt_epoch"
-    assert "speaker_map_epoch" in fn_block, "stream_transcript must use speaker_map_epoch for tagging"
+    fn_block = source[fn_pos : fn_pos + 600]
+    # Must capture epoch in outer scope (pinned), not read mutable speaker_map_epoch in inner cb
+    assert (
+        'pinned_epoch = speaker_map_epoch' in fn_block
+    ), "_make_dg_transcript_callback must pin epoch at creation time"
+    assert "_stt_epoch" in fn_block, "DG callback must tag segments with _stt_epoch"
 
 
-def test_multi_channel_callback_tags_segments_with_epoch():
-    """Source: multi-channel callback must also tag segments with _stt_epoch."""
+def test_dg_callback_used_for_connections():
+    """Source: process_audio_dg must receive _make_dg_transcript_callback(), not stream_transcript."""
+    source = _read_transcribe_source()
+    # Find all process_audio_dg calls (single-channel, not multi-channel)
+    recovery_pos = source.find('async def _recover_deepgram_connection')
+    assert recovery_pos > 0
+    recovery_block = source[recovery_pos : recovery_pos + 3000]
+    # Single-channel recovery must use _make_dg_transcript_callback()
+    assert (
+        '_make_dg_transcript_callback()' in recovery_block
+    ), "Single-channel recovery must use _make_dg_transcript_callback, not stream_transcript"
+
+
+def test_multi_channel_callback_pins_epoch():
+    """Source: multi-channel callback must pin epoch at creation time."""
     source = _read_transcribe_source()
     fn_pos = source.find('def make_multi_channel_callback')
     assert fn_pos > 0
     fn_block = source[fn_pos : fn_pos + 600]
+    assert 'pinned_epoch = speaker_map_epoch' in fn_block, "make_multi_channel_callback must pin epoch at creation time"
     assert "_stt_epoch" in fn_block, "multi-channel callback must tag segments with _stt_epoch"
 
 
@@ -673,3 +694,56 @@ def test_stale_buffer_segments_skipped_at_runtime():
     assert speaker_ops_performed == [
         'seg-2'
     ], f"Only epoch-1 segment should have speaker ops, got {speaker_ops_performed}"
+
+
+def test_late_old_socket_callback_tagged_stale():
+    """Runtime: old DG socket fires late callback after recovery — segment must be tagged stale.
+
+    Regression test for the race: old socket emits a transcript after recovery
+    bumps speaker_map_epoch. If the callback reads the *current* mutable epoch
+    instead of a pinned one, the segment gets the new epoch and bypasses the
+    stale guard. The pinned-epoch callback factory prevents this.
+    """
+    from collections import deque
+
+    buffer = deque(maxlen=100)
+    current_epoch = 0
+
+    # Simulate _make_dg_transcript_callback — pins epoch at creation time
+    def make_pinned_callback():
+        pinned = current_epoch
+
+        def cb(segments):
+            for seg in segments:
+                seg['_stt_epoch'] = pinned
+            buffer.extend(segments)
+
+        return cb
+
+    # Create callback at epoch 0 (old DG connection)
+    old_callback = make_pinned_callback()
+
+    # Recovery: bump epoch
+    current_epoch = 1
+
+    # Create callback for new DG connection at epoch 1
+    new_callback = make_pinned_callback()
+
+    # Old socket fires late callback AFTER recovery
+    old_callback([{'text': 'late from old DG', 'speaker': 'SPEAKER_0', 'is_user': False, 'start': 0.0, 'end': 1.0}])
+    # New socket sends segment
+    new_callback([{'text': 'from new DG', 'speaker': 'SPEAKER_0', 'is_user': False, 'start': 1.0, 'end': 2.0}])
+
+    segments = list(buffer)
+    assert len(segments) == 2
+    # Old callback segment must have old epoch (0), not current (1)
+    assert (
+        segments[0]['_stt_epoch'] == 0
+    ), f"Late old-socket segment should have epoch 0, got {segments[0]['_stt_epoch']}"
+    # New callback segment has current epoch
+    assert segments[1]['_stt_epoch'] == 1
+
+    # Filtering: only epoch-1 segments pass the stale guard
+    fresh = [s for s in segments if s['_stt_epoch'] == current_epoch]
+    assert len(fresh) == 1
+    assert fresh[0]['text'] == 'from new DG'
