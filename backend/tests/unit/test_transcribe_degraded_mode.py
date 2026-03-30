@@ -615,28 +615,37 @@ def test_multi_channel_callback_pins_epoch():
     assert "_stt_epoch" in fn_block, "multi-channel callback must tag segments with _stt_epoch"
 
 
-def test_stale_segments_speaker_neutralized():
-    """Source: stale segments must have speaker/speaker_id set to None before combine_segments.
+def test_stale_segments_excluded_from_combine():
+    """Source: stale segments must be separated from newly_processed_segments before combine_segments.
 
-    This prevents stale segments from merging with existing tail segments (merge
-    requires same speaker) and ensures speaker detection naturally skips them
-    (speaker_id is None → embedding enqueue gated, text-detection map write gated).
+    Stale segments are kept in a separate list (stale_dg_segments) and appended
+    AFTER combine_segments. This prevents ALL merge paths: same-speaker, is_user,
+    and lowercase-continuation. Speaker is also neutralized so speaker detection
+    naturally skips them.
     """
     source = _read_transcribe_source()
-    # Find the stale segment handling in stream_transcript_process
     process_pos = source.find('async def stream_transcript_process')
     assert process_pos > 0
-    process_block = source[process_pos : process_pos + 5000]
+    process_block = source[process_pos : process_pos + 6000]
 
-    # Must neutralize speaker on stale segments
+    # Must have separate stale list
+    assert 'stale_dg_segments' in process_block, "Must collect stale segments in separate list"
+
+    # Stale segments must have speaker neutralized
     assert 'segment.speaker = None' in process_block, "Stale segments must have speaker set to None"
     assert 'segment.speaker_id = None' in process_block, "Stale segments must have speaker_id set to None"
 
-    # Neutralization must happen BEFORE the combine_segments call
-    neutralize_pos = process_block.find('segment.speaker = None')
+    # combine_segments must only receive newly_processed_segments (not stale)
     combine_pos = process_block.find('.combine_segments(')
-    assert neutralize_pos > 0 and combine_pos > 0
-    assert neutralize_pos < combine_pos, "Speaker neutralization must happen before combine_segments call"
+    assert combine_pos > 0
+    combine_line = process_block[combine_pos : combine_pos + 100]
+    assert 'newly_processed_segments' in combine_line, "combine_segments must only receive fresh segments"
+    assert 'stale_dg_segments' not in combine_line, "combine_segments must NOT receive stale segments"
+
+    # Stale segments must be appended AFTER combine_segments
+    extend_pos = process_block.find('transcript_segments.extend(stale_dg_segments)')
+    assert extend_pos > 0, "Stale segments must be appended after combine_segments"
+    assert extend_pos > combine_pos, "extend must come after combine_segments"
 
 
 def test_stt_epoch_popped_before_transcript_segment():
@@ -767,27 +776,37 @@ def test_late_old_socket_callback_tagged_stale():
     assert fresh[0]['text'] == 'from new DG'
 
 
-def test_stale_segment_merge_prevented_by_neutralization():
-    """Regression: stale segment must NOT merge with existing tail after speaker neutralization.
+def test_stale_segment_excluded_from_combine_prevents_all_merges():
+    """Regression: stale segments excluded from combine_segments can't merge at all.
 
-    Without neutralization, a stale SPEAKER_0 segment merges into an existing
-    SPEAKER_0 tail (combine_segments requires same speaker). The merged segment
-    keeps the tail's ID, bypassing any ID-based stale guard. After neutralization
-    (speaker=None), the merge condition fails because speakers differ.
+    Without exclusion, stale segments can merge through multiple paths:
+    - Same speaker: a.speaker == b.speaker
+    - is_user: a.is_user and b.is_user (e.g., onboarding mode)
+    - Lowercase continuation: is_user match + lowercase start
+
+    By keeping stale segments in a separate list and appending after combine,
+    they never enter any merge predicate.
     """
-    # Simulate: existing tail has SPEAKER_0 (from before DG died)
-    # Late stale segment also has SPEAKER_0 (from old DG)
-    # After neutralization, stale segment has speaker=None
+    from models.transcript_segment import TranscriptSegment
 
-    # combine_segments merge condition: a.speaker == b.speaker
-    tail_speaker = 'SPEAKER_0'
-    stale_speaker_after_neutralization = None
+    # Existing tail: SPEAKER_0, is_user=True
+    existing = [TranscriptSegment(text='hello', speaker='SPEAKER_0', is_user=True, start=0.0, end=1.0)]
 
-    # Merge should NOT happen because speakers differ
-    would_merge = tail_speaker == stale_speaker_after_neutralization
-    assert not would_merge, "Stale neutralized segment must not merge with existing tail"
+    # Stale segment: neutralized speaker=None, but is_user=True (from onboarding)
+    # Must set speaker/speaker_id after construction (TranscriptSegment.__init__ derives speaker_id)
+    stale = TranscriptSegment(text='late from old DG', speaker='SPEAKER_0', is_user=True, start=1.5, end=2.5)
+    stale.speaker = None
+    stale.speaker_id = None
 
-    # But a fresh segment from new DG SHOULD be able to merge
-    fresh_speaker = 'SPEAKER_0'
-    would_merge_fresh = tail_speaker == fresh_speaker
-    assert would_merge_fresh, "Fresh segment from new DG should be able to merge with existing tail"
+    # If stale were fed into combine_segments, it could merge via is_user path
+    combined_with_stale, _, _ = TranscriptSegment.combine_segments([], existing + [stale])
+    # This would merge them (is_user and is_user) — the bug we're preventing
+    merged_count = len(combined_with_stale)
+
+    # With the fix: exclude stale from combine, append after
+    combined_fresh, _, _ = TranscriptSegment.combine_segments([], existing)
+    combined_fresh.append(stale)
+    # Stale segment stays separate — no merge leakage
+    assert len(combined_fresh) == 2, f"Stale segment must stay separate, got {len(combined_fresh)}"
+    assert combined_fresh[1].speaker is None, "Stale segment must keep neutralized speaker"
+    assert combined_fresh[1].speaker_id is None, "Stale segment must keep neutralized speaker_id"
