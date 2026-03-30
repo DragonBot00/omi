@@ -9,6 +9,7 @@ import struct
 import time
 import uuid
 import wave
+from ulid import ULID
 from collections import deque, OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -397,7 +398,7 @@ async def _stream_handler(
 
     locked_conversation_ids: Set[str] = set()
     speaker_to_person_map: Dict[int, Tuple[str, str]] = {}
-    speaker_map_epoch: int = 0  # Incremented on DG recovery; in-flight tasks check before writing
+    current_stt_session: str = str(ULID())  # Rotated on DG recovery; segments carry this for merge barrier
     segment_person_assignment_map: Dict[str, str] = {}
     current_session_segments: Dict[str, bool] = {}  # Store only speech_profile_processed status
     suggested_segments: Set[str] = set()
@@ -932,36 +933,32 @@ async def _stream_handler(
 
     def stream_transcript(segments):
         nonlocal realtime_segment_buffers
-        # Note: DG timestamp remapping is handled inside GatedDeepgramSocket wrapper
-        # Manual calls (e.g. from pusher callback) don't set _dg_generation —
-        # the pop() default in stream_transcript_process treats them as current generation.
         realtime_segment_buffers.extend(segments)
 
     def _make_dg_transcript_callback():
-        """Create a transcript callback pinned to the current DG generation.
+        """Create a transcript callback pinned to the current STT session.
 
-        Each DG connection gets its own callback with a frozen generation captured at
-        connection time. If the old socket fires a late callback after recovery
-        bumps speaker_map_epoch, the segment is tagged with the old generation
-        and gets a different stt_provider during processing, which prevents merge.
+        Each DG connection gets its own callback with a frozen stt_session ULID.
+        If the old socket fires a late callback after recovery rotates the session,
+        segments carry the old ULID and combine_segments won't merge them with new ones.
         """
-        pinned_generation = speaker_map_epoch
+        pinned_session = current_stt_session
 
         def cb(segments):
             for seg in segments:
-                seg['_dg_generation'] = pinned_generation
+                seg['stt_session'] = pinned_session
             realtime_segment_buffers.extend(segments)
 
         return cb
 
     def make_multi_channel_callback(cfg):
-        pinned_generation = speaker_map_epoch
+        pinned_session = current_stt_session
 
         def cb(segments):
             for seg in segments:
                 seg['is_user'] = cfg.is_user
                 seg['speaker'] = cfg.speaker_label
-                seg['_dg_generation'] = pinned_generation
+                seg['stt_session'] = pinned_session
             realtime_segment_buffers.extend(segments)
 
         return cb
@@ -984,23 +981,17 @@ async def _stream_handler(
         """Reset DG-diarization-dependent speaker state after socket recovery.
 
         A new DG connection resets diarization — speaker numbers (SPEAKER_0, SPEAKER_1, etc.)
-        may be reassigned differently. The old speaker_to_person_map entries would map the wrong
-        person to the wrong speaker number, so we clear them and let the embedding-based
-        identification re-learn the new assignments.
-
-        Increments speaker_map_epoch (DG generation counter) so:
+        may be reassigned differently. Rotates current_stt_session so:
         - In-flight _match_speaker_embedding tasks discard stale results
-        - Buffered segments from the old connection get stt_provider='deepgram:stale',
-          which prevents combine_segments from merging them with fresh segments
-
-        We keep person_embeddings_cache (embeddings are connection-independent) and
-        segment_person_assignment_map (already-persisted segment→person assignments).
+        - Buffered segments from the old connection carry the old stt_session ULID,
+          and combine_segments won't merge them with new-session segments
         """
-        nonlocal speaker_map_dirty, speaker_map_epoch
+        nonlocal speaker_map_dirty, current_stt_session
         old_count = len(speaker_to_person_map)
+        old_session = current_stt_session
         speaker_to_person_map.clear()
         suggested_segments.clear()
-        speaker_map_epoch += 1
+        current_stt_session = str(ULID())
         # Drain stale items from the speaker_id_segment_queue (old speaker_ids)
         drained = 0
         while not speaker_id_segment_queue.empty():
@@ -1012,10 +1003,12 @@ async def _stream_handler(
         if old_count > 0 or drained > 0:
             speaker_map_dirty = True
         logger.info(
-            'Speaker state reset after DG recovery: cleared %d mappings, drained %d queue items, epoch=%d %s %s',
+            'Speaker state reset after DG recovery: cleared %d mappings, drained %d queue items, '
+            'session %s -> %s %s %s',
             old_count,
             drained,
-            speaker_map_epoch,
+            old_session[:8],
+            current_stt_session[:8],
             uid,
             session_id,
         )
@@ -2071,14 +2064,14 @@ async def _stream_handler(
 
             duration = seg['duration']
             if duration >= SPEAKER_ID_MIN_AUDIO:
-                task = spawn(_match_speaker_embedding(speaker_id, seg, epoch=speaker_map_epoch))
+                task = spawn(_match_speaker_embedding(speaker_id, seg, stt_session=current_stt_session))
                 speaker_match_tasks.add(task)
                 task.add_done_callback(speaker_match_tasks.discard)
 
         logger.info(f"Speaker ID task ended {uid} {session_id}")
         speaker_id_done.set()
 
-    async def _match_speaker_embedding(speaker_id: int, segment: dict, epoch: int = 0):
+    async def _match_speaker_embedding(speaker_id: int, segment: dict, stt_session: str = ''):
         """Extract audio from ring buffer and match against stored embeddings."""
         nonlocal speaker_to_person_map, segment_person_assignment_map, audio_ring_buffer, speaker_map_dirty
 
@@ -2173,12 +2166,12 @@ async def _stream_handler(
                     best_distance = distance
                     best_match = (person_id, data['name'])
 
-            # Epoch guard: if DG recovered since this task was spawned, our speaker_id
+            # Session guard: if DG recovered since this task was spawned, our speaker_id
             # is from the old connection's diarization and must not pollute the new map.
-            if epoch != speaker_map_epoch:
+            if stt_session != current_stt_session:
                 logger.info(
                     f"Speaker ID: discarding stale match for speaker {speaker_id} "
-                    f"(epoch {epoch} != {speaker_map_epoch}) {uid} {session_id}"
+                    f"(session {stt_session[:8]} != {current_stt_session[:8]}) {uid} {session_id}"
                 )
                 return
 
@@ -2352,19 +2345,12 @@ async def _stream_handler(
 
                 processed_segments = []
                 for s in segments_to_process:
-                    seg_generation = s.pop('_dg_generation', speaker_map_epoch)
+                    # stt_session is already set by the DG callback — TranscriptSegment picks it up.
+                    # combine_segments uses stt_session mismatch as a merge barrier, so segments
+                    # from a pre-recovery DG connection won't merge with post-recovery ones.
                     segment = TranscriptSegment(**s, speech_profile_processed=True)
-                    if seg_generation != speaker_map_epoch:
-                        # Stale segment from old DG connection: neutralize speaker and stamp
-                        # a different stt_provider so combine_segments won't merge it with
-                        # fresh segments (stt_provider mismatch is a hard merge barrier).
-                        segment.speaker = None
-                        segment.speaker_id = None
-                        segment.stt_provider = 'deepgram:stale'
-                    else:
-                        segment.stt_provider = 'deepgram'
-                        if onboarding_mode and s.get('speaker_id') != OnboardingHandler.OMI_SPEAKER_ID:
-                            segment.is_user = True
+                    if onboarding_mode and s.get('speaker_id') != OnboardingHandler.OMI_SPEAKER_ID:
+                        segment.is_user = True
                     processed_segments.append(segment)
 
                 words_transcribed = len(" ".join([seg.text for seg in processed_segments]).split())
@@ -2373,9 +2359,6 @@ async def _stream_handler(
 
                 for seg in processed_segments:
                     current_session_segments[seg.id] = seg.speech_profile_processed
-                # combine_segments respects stt_provider mismatch as a merge barrier,
-                # so stale segments (stt_provider='deepgram:stale') won't merge with
-                # fresh segments (stt_provider='deepgram') at any call site.
                 transcript_segments, _, _ = TranscriptSegment.combine_segments([], processed_segments)
 
             # Update transcript segments
@@ -2409,8 +2392,10 @@ async def _stream_handler(
                 if translation_enabled:
                     await translate(updated_segments, conversation.id)
 
-                # Speaker detection
+                # Speaker detection — skip segments from old STT sessions
                 for segment in updated_segments:
+                    if segment.stt_session and segment.stt_session != current_stt_session:
+                        continue
                     if segment.person_id or segment.is_user or segment.id in suggested_segments:
                         continue
 
