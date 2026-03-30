@@ -873,22 +873,15 @@ async def _stream_handler(
         segments: List[TranscriptSegment],
         photos: List[ConversationPhoto],
         finished_at: datetime,
-        stale_segments: Optional[List[TranscriptSegment]] = None,
     ):
         nonlocal speaker_map_dirty
         updated_segments: List[TranscriptSegment] = []
         removed_ids: List[str] = []
 
-        if segments or stale_segments:
-            if segments:
-                conversation.transcript_segments, updated_segments, removed_ids = TranscriptSegment.combine_segments(
-                    conversation.transcript_segments, segments
-                )
-            # Append stale segments after combine — they bypass all merge predicates
-            # to prevent merge leakage through is_user, same-speaker, or lowercase paths.
-            if stale_segments:
-                conversation.transcript_segments.extend(stale_segments)
-                updated_segments.extend(stale_segments)
+        if segments:
+            conversation.transcript_segments, updated_segments, removed_ids = TranscriptSegment.combine_segments(
+                conversation.transcript_segments, segments
+            )
             if speaker_map_dirty:
                 # A new speaker match was found — retroactively fix all earlier segments once
                 process_speaker_assigned_segments(
@@ -897,7 +890,7 @@ async def _stream_handler(
                     speaker_to_person_map,
                 )
                 speaker_map_dirty = False
-            elif segments:
+            else:
                 process_speaker_assigned_segments(
                     updated_segments,
                     segment_person_assignment_map,
@@ -940,35 +933,35 @@ async def _stream_handler(
     def stream_transcript(segments):
         nonlocal realtime_segment_buffers
         # Note: DG timestamp remapping is handled inside GatedDeepgramSocket wrapper
-        # Manual calls (e.g. from pusher callback) don't set _stt_epoch —
-        # the pop() default in stream_transcript_process treats them as current epoch.
+        # Manual calls (e.g. from pusher callback) don't set _dg_generation —
+        # the pop() default in stream_transcript_process treats them as current generation.
         realtime_segment_buffers.extend(segments)
 
     def _make_dg_transcript_callback():
-        """Create a transcript callback pinned to the current DG epoch.
+        """Create a transcript callback pinned to the current DG generation.
 
-        Each DG connection gets its own callback with a frozen epoch captured at
+        Each DG connection gets its own callback with a frozen generation captured at
         connection time. If the old socket fires a late callback after recovery
-        bumps speaker_map_epoch, the segment is tagged with the old (stale) epoch
-        and correctly filtered out during speaker matching.
+        bumps speaker_map_epoch, the segment is tagged with the old generation
+        and gets a different stt_provider during processing, which prevents merge.
         """
-        pinned_epoch = speaker_map_epoch
+        pinned_generation = speaker_map_epoch
 
         def cb(segments):
             for seg in segments:
-                seg['_stt_epoch'] = pinned_epoch
+                seg['_dg_generation'] = pinned_generation
             realtime_segment_buffers.extend(segments)
 
         return cb
 
     def make_multi_channel_callback(cfg):
-        pinned_epoch = speaker_map_epoch
+        pinned_generation = speaker_map_epoch
 
         def cb(segments):
             for seg in segments:
                 seg['is_user'] = cfg.is_user
                 seg['speaker'] = cfg.speaker_label
-                seg['_stt_epoch'] = pinned_epoch
+                seg['_dg_generation'] = pinned_generation
             realtime_segment_buffers.extend(segments)
 
         return cb
@@ -995,8 +988,10 @@ async def _stream_handler(
         person to the wrong speaker number, so we clear them and let the embedding-based
         identification re-learn the new assignments.
 
-        Increments speaker_map_epoch so in-flight _match_speaker_embedding tasks (spawned
-        before recovery) discard their results instead of writing stale speaker IDs back.
+        Increments speaker_map_epoch (DG generation counter) so:
+        - In-flight _match_speaker_embedding tasks discard stale results
+        - Buffered segments from the old connection get stt_provider='deepgram:stale',
+          which prevents combine_segments from merging them with fresh segments
 
         We keep person_embeddings_cache (embeddings are connection-independent) and
         segment_person_assignment_map (already-persisted segment→person assignments).
@@ -2333,7 +2328,6 @@ async def _stream_handler(
                 continue
 
             transcript_segments = []
-            stale_dg_segments = []
             if segments_to_process:
                 last_transcript_time = time.time()
 
@@ -2356,44 +2350,37 @@ async def _stream_handler(
                     segment["end"] += time_offset
                     segments_to_process[i] = segment
 
-                newly_processed_segments = []
-                stale_dg_segments = []  # Excluded from combine_segments to prevent all merge paths
+                processed_segments = []
                 for s in segments_to_process:
-                    seg_epoch = s.pop('_stt_epoch', speaker_map_epoch)
+                    seg_generation = s.pop('_dg_generation', speaker_map_epoch)
                     segment = TranscriptSegment(**s, speech_profile_processed=True)
-                    if seg_epoch != speaker_map_epoch:
-                        # Neutralize speaker on stale segments so speaker detection skips them.
-                        # Kept separate from newly_processed_segments to block ALL merge paths
-                        # in combine_segments (same-speaker, is_user, lowercase-continuation).
+                    if seg_generation != speaker_map_epoch:
+                        # Stale segment from old DG connection: neutralize speaker and stamp
+                        # a different stt_provider so combine_segments won't merge it with
+                        # fresh segments (stt_provider mismatch is a hard merge barrier).
                         segment.speaker = None
                         segment.speaker_id = None
-                        stale_dg_segments.append(segment)
+                        segment.stt_provider = 'deepgram:stale'
                     else:
-                        # In onboarding mode, force is_user=True for non-Omi segments (user's answers)
+                        segment.stt_provider = 'deepgram'
                         if onboarding_mode and s.get('speaker_id') != OnboardingHandler.OMI_SPEAKER_ID:
                             segment.is_user = True
-                        newly_processed_segments.append(segment)
+                    processed_segments.append(segment)
 
-                all_segments = newly_processed_segments + stale_dg_segments
-                words_transcribed = len(" ".join([seg.text for seg in all_segments]).split())
+                words_transcribed = len(" ".join([seg.text for seg in processed_segments]).split())
                 if words_transcribed > 0:
                     words_transcribed_since_last_record += words_transcribed
 
-                for seg in all_segments:
+                for seg in processed_segments:
                     current_session_segments[seg.id] = seg.speech_profile_processed
-                # Only combine fresh segments — stale segments passed separately to
-                # _update_in_progress_conversation to bypass both combine_segments calls.
-                transcript_segments, _, _ = TranscriptSegment.combine_segments([], newly_processed_segments)
+                # combine_segments respects stt_provider mismatch as a merge barrier,
+                # so stale segments (stt_provider='deepgram:stale') won't merge with
+                # fresh segments (stt_provider='deepgram') at any call site.
+                transcript_segments, _, _ = TranscriptSegment.combine_segments([], processed_segments)
 
             # Update transcript segments
             conversation = Conversation(**conversation_data)
-            result = _update_in_progress_conversation(
-                conversation,
-                transcript_segments,
-                photos_to_process,
-                finished_at,
-                stale_segments=stale_dg_segments if stale_dg_segments else None,
-            )
+            result = _update_in_progress_conversation(conversation, transcript_segments, photos_to_process, finished_at)
             if not result or not result[0]:
                 continue
             conversation, updated_segments, removed_ids = result
@@ -2401,17 +2388,16 @@ async def _stream_handler(
             if removed_ids:
                 _send_message_event(SegmentsDeletedEvent(segment_ids=removed_ids))
 
-            if transcript_segments or stale_dg_segments:
+            if transcript_segments:
                 await websocket.send_json([segment.dict() for segment in updated_segments])
 
-                all_outgoing_segments = transcript_segments + stale_dg_segments
                 if transcript_send is not None and user_has_credits:
-                    transcript_send([segment.dict() for segment in all_outgoing_segments])
+                    transcript_send([segment.dict() for segment in transcript_segments])
                 elif not PUSHER_ENABLED and user_has_credits:
                     # Fallback: trigger realtime integrations directly when pusher is disabled
                     try:
                         await trigger_realtime_integrations(
-                            uid, [s.dict() for s in all_outgoing_segments], current_conversation_id
+                            uid, [s.dict() for s in transcript_segments], current_conversation_id
                         )
                     except Exception as e:
                         logger.error(f"Error triggering realtime integrations: {e} {uid} {session_id}")
