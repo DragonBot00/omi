@@ -663,6 +663,24 @@ def test_stale_segments_excluded_from_combine():
     result2, _, _ = TranscriptSegment.combine_segments([], [seg_c, seg_d])
     assert len(result2) == 2, "Different stt_session segments must NOT merge (merge barrier)"
 
+    # Boundary: one side has stt_session=None (legacy segments) — should allow merge
+    seg_e = TranscriptSegment(text='legacy', speaker='SPEAKER_0', is_user=False, start=0.0, end=1.0)
+    assert seg_e.stt_session is None
+    seg_f = TranscriptSegment(text='also legacy', speaker='SPEAKER_0', is_user=False, start=1.0, end=2.0)
+    result3, _, _ = TranscriptSegment.combine_segments([], [seg_e, seg_f])
+    assert len(result3) == 1, "Both None stt_session should merge (legacy compat)"
+
+    # Boundary: one None + one set — should allow merge (backward compat)
+    seg_g = TranscriptSegment(text='legacy', speaker='SPEAKER_0', is_user=False, start=0.0, end=1.0)
+    seg_h = TranscriptSegment(text='new', speaker='SPEAKER_0', is_user=False, start=1.0, end=2.0, stt_session='ses-1')
+    result4, _, _ = TranscriptSegment.combine_segments([], [seg_g, seg_h])
+    assert len(result4) == 1, "None + set stt_session should merge (backward compat)"
+
+    seg_i = TranscriptSegment(text='new', speaker='SPEAKER_0', is_user=False, start=0.0, end=1.0, stt_session='ses-1')
+    seg_j = TranscriptSegment(text='legacy', speaker='SPEAKER_0', is_user=False, start=1.0, end=2.0)
+    result5, _, _ = TranscriptSegment.combine_segments([], [seg_i, seg_j])
+    assert len(result5) == 1, "Set + None stt_session should merge (backward compat)"
+
 
 def test_stt_session_flows_through_to_transcript_segment():
     """Source: stt_session set by callback flows directly into TranscriptSegment (no pop needed).
