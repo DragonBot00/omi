@@ -382,6 +382,12 @@ async def connect_to_deepgram_with_backoff(
     is_active: Optional[Callable[[], bool]] = None,
 ):
     logger.info("connect_to_deepgram_with_backoff")
+    # Check session liveness BEFORE consuming a CB probe slot — a stale session
+    # transitioning CB from open→half_open then aborting would wedge the pod.
+    if is_active is not None and not is_active():
+        logger.warning("Session ended before connect attempt, aborting")
+        return None
+
     if not deepgram_circuit_breaker.allow_request():
         logger.warning("Deepgram circuit breaker OPEN, skipping connect attempt")
         return None
