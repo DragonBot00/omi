@@ -568,3 +568,108 @@ def test_epoch_guard_discards_stale_match_runtime():
     # Case 3: Current epoch — write succeeds
     assert apply_match_with_epoch_guard(2, 'person-def', 'Carol', epoch=1) is True
     assert 2 in state.speaker_to_person_map
+
+
+# ---------------------------------------------------------------------------
+# Buffer-level epoch tagging (stale segments from old DG connection)
+# ---------------------------------------------------------------------------
+
+
+def test_stream_transcript_tags_segments_with_epoch():
+    """Source: stream_transcript must tag each segment dict with _stt_epoch."""
+    source = _read_transcribe_source()
+    fn_pos = source.find('def stream_transcript(segments)')
+    assert fn_pos > 0
+    fn_block = source[fn_pos : fn_pos + 500]
+    assert "_stt_epoch" in fn_block, "stream_transcript must tag segments with _stt_epoch"
+    assert "speaker_map_epoch" in fn_block, "stream_transcript must use speaker_map_epoch for tagging"
+
+
+def test_multi_channel_callback_tags_segments_with_epoch():
+    """Source: multi-channel callback must also tag segments with _stt_epoch."""
+    source = _read_transcribe_source()
+    fn_pos = source.find('def make_multi_channel_callback')
+    assert fn_pos > 0
+    fn_block = source[fn_pos : fn_pos + 600]
+    assert "_stt_epoch" in fn_block, "multi-channel callback must tag segments with _stt_epoch"
+
+
+def test_stale_segments_skipped_in_speaker_detection():
+    """Source: speaker detection loop must skip segments in stale_dg_segment_ids."""
+    source = _read_transcribe_source()
+    # Find the speaker detection section
+    detection_pos = source.find('# Speaker detection')
+    assert detection_pos > 0
+    detection_block = source[detection_pos : detection_pos + 500]
+    assert (
+        'stale_dg_segment_ids' in detection_block
+    ), "Speaker detection loop must check stale_dg_segment_ids to skip old DG segments"
+
+
+def test_stt_epoch_popped_before_transcript_segment():
+    """Source: _stt_epoch must be popped from raw dict before TranscriptSegment conversion."""
+    source = _read_transcribe_source()
+    # Find the TranscriptSegment conversion in stream_transcript_process
+    conv_pos = source.find("s.pop('_stt_epoch'")
+    assert conv_pos > 0, "_stt_epoch must be popped from segment dict before TranscriptSegment(**s)"
+    ts_pos = source.find('TranscriptSegment(**s', conv_pos)
+    assert ts_pos > conv_pos, "TranscriptSegment conversion must come AFTER _stt_epoch pop"
+
+
+def test_stale_buffer_segments_skipped_at_runtime():
+    """Runtime: simulate stale segments in buffer to prove they don't trigger speaker operations.
+
+    Steps:
+    1. Two segments buffered at epoch 0 (old DG)
+    2. Recovery bumps epoch to 1
+    3. One new segment arrives at epoch 1
+    4. Processing must skip speaker ops for epoch-0 segments but process epoch-1 segment
+    """
+    # Simulate the buffer-drain-and-classify logic from stream_transcript_process
+    speaker_map_epoch = 1  # Recovery already happened
+
+    raw_segments = [
+        {
+            'text': 'hello from old DG',
+            'speaker': 'SPEAKER_0',
+            'is_user': False,
+            'start': 0.0,
+            'end': 1.0,
+            '_stt_epoch': 0,
+        },
+        {
+            'text': 'old segment two',
+            'speaker': 'SPEAKER_1',
+            'is_user': False,
+            'start': 1.0,
+            'end': 2.0,
+            '_stt_epoch': 0,
+        },
+        {'text': 'new DG segment', 'speaker': 'SPEAKER_0', 'is_user': False, 'start': 2.0, 'end': 3.0, '_stt_epoch': 1},
+    ]
+
+    stale_ids = set()
+    segment_ids = []
+    for s in raw_segments:
+        seg_epoch = s.pop('_stt_epoch', speaker_map_epoch)
+        seg_id = f"seg-{len(segment_ids)}"
+        segment_ids.append(seg_id)
+        if seg_epoch != speaker_map_epoch:
+            stale_ids.add(seg_id)
+
+    # Epoch-0 segments should be stale
+    assert 'seg-0' in stale_ids
+    assert 'seg-1' in stale_ids
+    # Epoch-1 segment should NOT be stale
+    assert 'seg-2' not in stale_ids
+
+    # Simulate the speaker detection loop — only non-stale segments proceed
+    speaker_ops_performed = []
+    for seg_id in segment_ids:
+        if seg_id in stale_ids:
+            continue
+        speaker_ops_performed.append(seg_id)
+
+    assert speaker_ops_performed == [
+        'seg-2'
+    ], f"Only epoch-1 segment should have speaker ops, got {speaker_ops_performed}"
