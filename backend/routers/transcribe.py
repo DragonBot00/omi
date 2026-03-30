@@ -933,18 +933,35 @@ async def _stream_handler(
     def stream_transcript(segments):
         nonlocal realtime_segment_buffers
         # Note: DG timestamp remapping is handled inside GatedDeepgramSocket wrapper
-        # Tag each segment with the current DG epoch so stale segments from a previous
-        # connection can be identified during speaker matching after recovery.
-        for seg in segments:
-            seg['_stt_epoch'] = speaker_map_epoch
+        # Manual calls (e.g. from pusher callback) don't set _stt_epoch —
+        # the pop() default in stream_transcript_process treats them as current epoch.
         realtime_segment_buffers.extend(segments)
 
+    def _make_dg_transcript_callback():
+        """Create a transcript callback pinned to the current DG epoch.
+
+        Each DG connection gets its own callback with a frozen epoch captured at
+        connection time. If the old socket fires a late callback after recovery
+        bumps speaker_map_epoch, the segment is tagged with the old (stale) epoch
+        and correctly filtered out during speaker matching.
+        """
+        pinned_epoch = speaker_map_epoch
+
+        def cb(segments):
+            for seg in segments:
+                seg['_stt_epoch'] = pinned_epoch
+            realtime_segment_buffers.extend(segments)
+
+        return cb
+
     def make_multi_channel_callback(cfg):
+        pinned_epoch = speaker_map_epoch
+
         def cb(segments):
             for seg in segments:
                 seg['is_user'] = cfg.is_user
                 seg['speaker'] = cfg.speaker_label
-                seg['_stt_epoch'] = speaker_map_epoch
+                seg['_stt_epoch'] = pinned_epoch
             realtime_segment_buffers.extend(segments)
 
         return cb
@@ -1039,7 +1056,7 @@ async def _stream_handler(
                         return
                 else:
                     deepgram_socket = await process_audio_dg(
-                        stream_transcript,
+                        _make_dg_transcript_callback(),
                         stt_language,
                         sample_rate,
                         1,
@@ -1136,7 +1153,7 @@ async def _stream_handler(
                     vad_gate = None
 
             deepgram_socket = await process_audio_dg(
-                stream_transcript,
+                _make_dg_transcript_callback(),
                 stt_language,
                 sample_rate,
                 1,
