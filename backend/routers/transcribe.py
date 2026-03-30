@@ -2553,13 +2553,19 @@ async def _stream_handler(
                 if fair_use_dg_budget_exhausted:
                     pass  # Audio not forwarded to DG — budget/credits exhausted
                 else:
-                    try:
-                        dg_socket.send(chunk)
-                    except Exception as e:
-                        logger.error(f"Deepgram send failed, entering degraded mode: {e} {uid} {session_id}")
+                    dg_socket.send(chunk)
+                    # SafeDeepgramSocket.send() swallows failures and sets is_connection_dead;
+                    # check immediately so degraded mode starts on this flush, not the next one.
+                    if dg_socket.is_connection_dead:
+                        logger.error(
+                            'DG send failed mid-session uid=%s session=%s reason=%s',
+                            uid,
+                            session_id,
+                            dg_socket.death_reason or 'unknown',
+                        )
                         dg_socket = None
                         deepgram_socket = None  # Sync outer scope for recovery task
-                        await _enter_degraded_mode("STT degraded: reconnecting to Deepgram")
+                        await _enter_degraded_mode("STT degraded: DG send failed")
                         return
                     # Accumulate DG usage locally, flushed every 60s (#5854)
                     if fair_use_track_dg_usage:
@@ -2631,16 +2637,22 @@ async def _stream_handler(
                                 stt_sockets_multi[ch_idx] = None
                                 await _enter_degraded_mode("STT degraded: multi-channel DG connection died")
                             else:
-                                try:
-                                    mc_sock.send(pcm_16k)
-                                    # Accumulate DG usage locally, flushed every 60s (#5854)
-                                    if fair_use_track_dg_usage:
-                                        mc_chunk_ms = len(pcm_16k) * 1000 // (TARGET_SAMPLE_RATE * 2)
-                                        dg_usage_ms_pending += mc_chunk_ms
-                                except Exception as e:
-                                    logger.error(f"[MC-STT] ch={ch_idx} send error: {e} {uid} {session_id}")
+                                mc_sock.send(pcm_16k)
+                                # Check immediately after send — SafeDeepgramSocket swallows failures
+                                if mc_sock.is_connection_dead:
+                                    logger.error(
+                                        'MC-STT ch=%s send failed uid=%s session=%s reason=%s',
+                                        ch_idx,
+                                        uid,
+                                        session_id,
+                                        mc_sock.death_reason or 'unknown',
+                                    )
                                     stt_sockets_multi[ch_idx] = None
                                     await _enter_degraded_mode("STT degraded: multi-channel DG send failed")
+                                elif fair_use_track_dg_usage:
+                                    # Accumulate DG usage locally, flushed every 60s (#5854)
+                                    mc_chunk_ms = len(pcm_16k) * 1000 // (TARGET_SAMPLE_RATE * 2)
+                                    dg_usage_ms_pending += mc_chunk_ms
 
                         # Accumulate per-channel audio for mixing before sending to pusher
                         channel_mix_buffers[ch_idx].extend(pcm_16k)
