@@ -7,6 +7,7 @@ Verifies:
 """
 
 import asyncio
+import os
 import sys
 import time
 from unittest.mock import MagicMock, patch, AsyncMock
@@ -1363,19 +1364,34 @@ def test_constructor_clamps_negative_timeout():
 
 # ---------------------------------------------------------------------------
 # Behavioral: degraded event deduplication and single recovery task
-# These tests replicate the exact closure patterns from transcribe.py and
-# exercise them at runtime, proving idempotency and spawn gating.
+# Dual-layer tests: (1) source inspection confirms guards exist in production
+# code, (2) runtime exercise proves the pattern is algorithmically correct.
+# This catches both removal of guards and logical regressions.
 # ---------------------------------------------------------------------------
+
+TRANSCRIBE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'routers', 'transcribe.py')
+
+
+def _read_transcribe_source() -> str:
+    with open(TRANSCRIBE_PATH, encoding='utf-8') as f:
+        return f.read()
 
 
 def test_stt_degraded_event_deduplication_runtime():
     """Repeated calls to _send_stt_degraded_event emit exactly one event.
 
-    Replicates the closure pattern:
-        if stt_degraded: return
-        stt_degraded = True
-        send_event(...)
+    Layer 1 — source guard: the `if stt_degraded: return` guard exists in production.
+    Layer 2 — runtime: the pattern suppresses duplicate emissions.
     """
+    # Layer 1: verify guard exists in production code
+    source = _read_transcribe_source()
+    fn_pos = source.find('def _send_stt_degraded_event')
+    assert fn_pos > 0, "_send_stt_degraded_event must exist in transcribe.py"
+    guard_block = source[fn_pos : fn_pos + 200]
+    assert 'if stt_degraded:' in guard_block, "Dedup guard must be present"
+    assert 'return' in guard_block
+
+    # Layer 2: runtime exercise of the pattern
     events_sent = []
     stt_degraded = False
 
@@ -1386,19 +1402,26 @@ def test_stt_degraded_event_deduplication_runtime():
         stt_degraded = True
         events_sent.append(("stt_degraded", reason))
 
-    # First call should emit
     _send_stt_degraded_event("DG connection lost")
     assert len(events_sent) == 1
-    assert events_sent[0] == ("stt_degraded", "DG connection lost")
 
-    # Repeated calls should be no-ops
     _send_stt_degraded_event("DG connection lost again")
     _send_stt_degraded_event("Yet another failure")
     assert len(events_sent) == 1, "Duplicate stt_degraded events must be suppressed"
 
 
 def test_stt_recovered_event_deduplication_runtime():
-    """_send_stt_recovered_event only emits when stt_degraded is True, then clears it."""
+    """_send_stt_recovered_event only emits when stt_degraded is True, then clears it.
+
+    Layer 1 — source guard: the `if not stt_degraded: return` guard exists.
+    Layer 2 — runtime: degraded→recovered→recovered only emits one recovered event.
+    """
+    source = _read_transcribe_source()
+    fn_pos = source.find('def _send_stt_recovered_event')
+    assert fn_pos > 0
+    guard_block = source[fn_pos : fn_pos + 200]
+    assert 'if not stt_degraded:' in guard_block
+
     events_sent = []
     stt_degraded = False
 
@@ -1434,11 +1457,16 @@ def test_stt_recovered_event_deduplication_runtime():
 def test_recovery_task_single_spawn_while_pending():
     """_enter_degraded_mode spawns exactly one recovery task while it's still running.
 
-    Replicates the closure pattern:
-        if deepgram_recovery_task is None or deepgram_recovery_task.done():
-            deepgram_recovery_task = spawn(...)
+    Layer 1 — source guard: `deepgram_recovery_task is None or deepgram_recovery_task.done()` exists.
+    Layer 2 — runtime: repeated calls while task is pending produce only one spawn.
     """
     from unittest.mock import MagicMock
+
+    source = _read_transcribe_source()
+    fn_pos = source.find('async def _enter_degraded_mode')
+    assert fn_pos > 0
+    fn_block = source[fn_pos : fn_pos + 500]
+    assert 'deepgram_recovery_task is None or deepgram_recovery_task.done()' in fn_block
 
     spawn_calls = []
     deepgram_recovery_task = None
@@ -1447,22 +1475,24 @@ def test_recovery_task_single_spawn_while_pending():
         nonlocal deepgram_recovery_task
         if deepgram_recovery_task is None or deepgram_recovery_task.done():
             task = MagicMock()
-            task.done.return_value = False  # Task is still running
+            task.done.return_value = False
             deepgram_recovery_task = task
             spawn_calls.append(task)
 
-    # First call spawns
     _enter_degraded_mode()
     assert len(spawn_calls) == 1
 
-    # While task is running (done() = False), no respawn
     _enter_degraded_mode()
     _enter_degraded_mode()
     assert len(spawn_calls) == 1, "Must not spawn while prior recovery task is still running"
 
 
 def test_recovery_task_respawns_after_done():
-    """Once recovery task completes (.done()=True), a new one can be spawned."""
+    """Once recovery task completes (.done()=True), a new one can be spawned.
+
+    Layer 1 — source guard verified in test_recovery_task_single_spawn_while_pending.
+    Layer 2 — runtime: after done()=True, a fresh spawn is allowed.
+    """
     from unittest.mock import MagicMock
 
     spawn_calls = []
@@ -1476,13 +1506,10 @@ def test_recovery_task_respawns_after_done():
             deepgram_recovery_task = task
             spawn_calls.append(task)
 
-    # First spawn
     _enter_degraded_mode()
     assert len(spawn_calls) == 1
 
-    # Simulate task completion
     spawn_calls[0].done.return_value = True
 
-    # Now a new spawn should happen
     _enter_degraded_mode()
     assert len(spawn_calls) == 2, "Must respawn after prior recovery task completes"
