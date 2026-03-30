@@ -150,6 +150,32 @@ sequenceDiagram
     Note over Backend: Retry exhaustion: after MAX_RETRIES (3),<br/>conversation stays buffered with reset sent_at.<br/>cleanup_processing_conversations picks it up next session.
 ```
 
+## 3.2 Deepgram Circuit Breaker & Degraded Transcription Mode
+
+When the Deepgram STT connection fails, the session enters **degraded mode**
+instead of closing the WebSocket with code 1011. A background recovery task
+reconnects to Deepgram with exponential backoff.
+
+**Circuit Breaker** (`DeepgramCircuitBreaker` in `utils/stt/streaming.py`):
+- Pod-level singleton, thread-safe. States: `closed` → `open` → `half_open` → `closed`.
+- After `DEEPGRAM_CB_FAILURE_THRESHOLD` (default 3) consecutive failures, moves to `open`.
+- After `DEEPGRAM_CB_RESET_TIMEOUT_SECONDS` (default 30), transitions to `half_open` and allows a single probe.
+- Probe success → `closed`; probe failure → back to `open` with fresh timer.
+- Stale sessions (`is_active=False`) are checked before `allow_request()` to avoid wedging `half_open`.
+
+**Status Events** (sent to client via WebSocket):
+- `stt_degraded` — Deepgram connection lost; audio continues to buffer but is not transcribed.
+- `stt_recovered` — Deepgram reconnected; transcription resumes.
+
+**Recovery Flow**:
+1. `flush_stt_buffer()` or `_process_stt()` detects dead DG socket → calls `_enter_degraded_mode()`.
+2. `_enter_degraded_mode()` sends `stt_degraded` event, spawns `_recover_deepgram_connection()`.
+3. Recovery task retries `process_audio_dg()` with exponential backoff.
+4. On success: sets `deepgram_socket`, activates VAD gate if in shadow mode, sends `stt_recovered`.
+5. `flush_stt_buffer()` picks up the recovered socket on the next audio chunk.
+
+Multi-channel sessions recover individual failed channels independently.
+
 ## 4. Speaker ID Lifecycle (2-Session Flow)
 
 Speaker identification requires two sessions: one to store the embedding, one
@@ -241,6 +267,8 @@ sequenceDiagram
 | Event | Fields | When |
 |-------|--------|------|
 | `service_status` | `{type, status: "ready"}` | After WS connect, services initialized |
+| `service_status` | `{type, status: "stt_degraded", status_text}` | DG connection lost, entering degraded mode |
+| `service_status` | `{type, status: "stt_recovered", status_text}` | DG reconnected, transcription restored |
 | `memory_processing_started` | `{type}` | Conversation sent to pusher for LLM |
 | `memory_created` | `{type, memory: {id, structured: {title, overview, ...}}}` | LLM processing complete |
 | `speaker_label_suggestion` | `{type, person_id, person_name, distance, segments}` | Speaker matched via embedding |
