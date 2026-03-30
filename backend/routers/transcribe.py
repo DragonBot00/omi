@@ -2349,26 +2349,34 @@ async def _stream_handler(
                     segments_to_process[i] = segment
 
                 newly_processed_segments = []
+                stale_dg_segments = []  # Excluded from combine_segments to prevent all merge paths
                 for s in segments_to_process:
                     seg_epoch = s.pop('_stt_epoch', speaker_map_epoch)
                     segment = TranscriptSegment(**s, speech_profile_processed=True)
                     if seg_epoch != speaker_map_epoch:
-                        # Neutralize speaker on stale segments so they can't pollute speaker maps
-                        # even if combine_segments merges them into an existing tail.
-                        # Text is preserved; only speaker matching is suppressed.
+                        # Neutralize speaker on stale segments so speaker detection skips them.
+                        # Kept separate from newly_processed_segments to block ALL merge paths
+                        # in combine_segments (same-speaker, is_user, lowercase-continuation).
                         segment.speaker = None
                         segment.speaker_id = None
-                    # In onboarding mode, force is_user=True for non-Omi segments (user's answers)
-                    if onboarding_mode and s.get('speaker_id') != OnboardingHandler.OMI_SPEAKER_ID:
-                        segment.is_user = True
-                    newly_processed_segments.append(segment)
-                words_transcribed = len(" ".join([seg.text for seg in newly_processed_segments]).split())
+                        stale_dg_segments.append(segment)
+                    else:
+                        # In onboarding mode, force is_user=True for non-Omi segments (user's answers)
+                        if onboarding_mode and s.get('speaker_id') != OnboardingHandler.OMI_SPEAKER_ID:
+                            segment.is_user = True
+                        newly_processed_segments.append(segment)
+
+                all_segments = newly_processed_segments + stale_dg_segments
+                words_transcribed = len(" ".join([seg.text for seg in all_segments]).split())
                 if words_transcribed > 0:
                     words_transcribed_since_last_record += words_transcribed
 
-                for seg in newly_processed_segments:
+                for seg in all_segments:
                     current_session_segments[seg.id] = seg.speech_profile_processed
+                # Only combine fresh segments — stale segments are appended after to prevent
+                # merge leakage through is_user, lowercase-continuation, or same-speaker paths.
                 transcript_segments, _, _ = TranscriptSegment.combine_segments([], newly_processed_segments)
+                transcript_segments.extend(stale_dg_segments)
 
             # Update transcript segments
             conversation = Conversation(**conversation_data)
