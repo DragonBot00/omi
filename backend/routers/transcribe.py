@@ -957,6 +957,39 @@ async def _stream_handler(
         stt_degraded = False
         _send_message_event(MessageServiceStatusEvent(status="stt_recovered", status_text="STT Service Restored"))
 
+    def _reset_speaker_state_after_recovery():
+        """Reset DG-diarization-dependent speaker state after socket recovery.
+
+        A new DG connection resets diarization — speaker numbers (SPEAKER_0, SPEAKER_1, etc.)
+        may be reassigned differently. The old speaker_to_person_map entries would map the wrong
+        person to the wrong speaker number, so we clear them and let the embedding-based
+        identification re-learn the new assignments.
+
+        We keep person_embeddings_cache (embeddings are connection-independent) and
+        segment_person_assignment_map (already-persisted segment→person assignments).
+        """
+        nonlocal speaker_map_dirty
+        old_count = len(speaker_to_person_map)
+        speaker_to_person_map.clear()
+        suggested_segments.clear()
+        # Drain stale items from the speaker_id_segment_queue (old speaker_ids)
+        drained = 0
+        while not speaker_id_segment_queue.empty():
+            try:
+                speaker_id_segment_queue.get_nowait()
+                drained += 1
+            except asyncio.QueueEmpty:
+                break
+        if old_count > 0 or drained > 0:
+            speaker_map_dirty = True
+            logger.info(
+                'Speaker state reset after DG recovery: cleared %d speaker mappings, drained %d queue items %s %s',
+                old_count,
+                drained,
+                uid,
+                session_id,
+            )
+
     async def _recover_deepgram_connection():
         nonlocal deepgram_socket
         nonlocal deepgram_recovery_task
@@ -1013,6 +1046,8 @@ async def _stream_handler(
                         ):
                             vad_gate.activate()
                             logger.info('VAD gate activated after DG recovery uid=%s session=%s', uid, session_id)
+                        # New DG connection resets diarization — clear stale speaker mappings
+                        _reset_speaker_state_after_recovery()
                         logger.info(f"Recovered Deepgram socket {uid} {session_id}")
                         _send_stt_recovered_event()
                         return
