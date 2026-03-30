@@ -2617,15 +2617,30 @@ async def _stream_handler(
                         pcm_16k = resample_pcm(bytes(audio_data), sample_rate, TARGET_SAMPLE_RATE)
 
                         # Send to per-channel STT (budget-gated for restricted/exhausted users)
-                        if stt_sockets_multi[ch_idx] and not fair_use_dg_budget_exhausted:
-                            try:
-                                stt_sockets_multi[ch_idx].send(pcm_16k)
-                                # Accumulate DG usage locally, flushed every 60s (#5854)
-                                if fair_use_track_dg_usage:
-                                    mc_chunk_ms = len(pcm_16k) * 1000 // (TARGET_SAMPLE_RATE * 2)
-                                    dg_usage_ms_pending += mc_chunk_ms
-                            except Exception as e:
-                                logger.error(f"[MC-STT] ch={ch_idx} send error: {e} {uid} {session_id}")
+                        mc_sock = stt_sockets_multi[ch_idx]
+                        if mc_sock and not fair_use_dg_budget_exhausted:
+                            # Detect dead multi-channel socket and null the slot for recovery
+                            if mc_sock.is_connection_dead:
+                                logger.error(
+                                    'MC-STT ch=%s connection died uid=%s session=%s reason=%s',
+                                    ch_idx,
+                                    uid,
+                                    session_id,
+                                    mc_sock.death_reason or 'unknown',
+                                )
+                                stt_sockets_multi[ch_idx] = None
+                                await _enter_degraded_mode("STT degraded: multi-channel DG connection died")
+                            else:
+                                try:
+                                    mc_sock.send(pcm_16k)
+                                    # Accumulate DG usage locally, flushed every 60s (#5854)
+                                    if fair_use_track_dg_usage:
+                                        mc_chunk_ms = len(pcm_16k) * 1000 // (TARGET_SAMPLE_RATE * 2)
+                                        dg_usage_ms_pending += mc_chunk_ms
+                                except Exception as e:
+                                    logger.error(f"[MC-STT] ch={ch_idx} send error: {e} {uid} {session_id}")
+                                    stt_sockets_multi[ch_idx] = None
+                                    await _enter_degraded_mode("STT degraded: multi-channel DG send failed")
 
                         # Accumulate per-channel audio for mixing before sending to pusher
                         channel_mix_buffers[ch_idx].extend(pcm_16k)
