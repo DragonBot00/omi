@@ -873,15 +873,22 @@ async def _stream_handler(
         segments: List[TranscriptSegment],
         photos: List[ConversationPhoto],
         finished_at: datetime,
+        stale_segments: Optional[List[TranscriptSegment]] = None,
     ):
         nonlocal speaker_map_dirty
         updated_segments: List[TranscriptSegment] = []
         removed_ids: List[str] = []
 
-        if segments:
-            conversation.transcript_segments, updated_segments, removed_ids = TranscriptSegment.combine_segments(
-                conversation.transcript_segments, segments
-            )
+        if segments or stale_segments:
+            if segments:
+                conversation.transcript_segments, updated_segments, removed_ids = TranscriptSegment.combine_segments(
+                    conversation.transcript_segments, segments
+                )
+            # Append stale segments after combine — they bypass all merge predicates
+            # to prevent merge leakage through is_user, same-speaker, or lowercase paths.
+            if stale_segments:
+                conversation.transcript_segments.extend(stale_segments)
+                updated_segments.extend(stale_segments)
             if speaker_map_dirty:
                 # A new speaker match was found — retroactively fix all earlier segments once
                 process_speaker_assigned_segments(
@@ -890,7 +897,7 @@ async def _stream_handler(
                     speaker_to_person_map,
                 )
                 speaker_map_dirty = False
-            else:
+            elif segments:
                 process_speaker_assigned_segments(
                     updated_segments,
                     segment_person_assignment_map,
@@ -2326,6 +2333,7 @@ async def _stream_handler(
                 continue
 
             transcript_segments = []
+            stale_dg_segments = []
             if segments_to_process:
                 last_transcript_time = time.time()
 
@@ -2373,14 +2381,19 @@ async def _stream_handler(
 
                 for seg in all_segments:
                     current_session_segments[seg.id] = seg.speech_profile_processed
-                # Only combine fresh segments — stale segments are appended after to prevent
-                # merge leakage through is_user, lowercase-continuation, or same-speaker paths.
+                # Only combine fresh segments — stale segments passed separately to
+                # _update_in_progress_conversation to bypass both combine_segments calls.
                 transcript_segments, _, _ = TranscriptSegment.combine_segments([], newly_processed_segments)
-                transcript_segments.extend(stale_dg_segments)
 
             # Update transcript segments
             conversation = Conversation(**conversation_data)
-            result = _update_in_progress_conversation(conversation, transcript_segments, photos_to_process, finished_at)
+            result = _update_in_progress_conversation(
+                conversation,
+                transcript_segments,
+                photos_to_process,
+                finished_at,
+                stale_segments=stale_dg_segments if stale_dg_segments else None,
+            )
             if not result or not result[0]:
                 continue
             conversation, updated_segments, removed_ids = result
@@ -2388,16 +2401,17 @@ async def _stream_handler(
             if removed_ids:
                 _send_message_event(SegmentsDeletedEvent(segment_ids=removed_ids))
 
-            if transcript_segments:
+            if transcript_segments or stale_dg_segments:
                 await websocket.send_json([segment.dict() for segment in updated_segments])
 
+                all_outgoing_segments = transcript_segments + stale_dg_segments
                 if transcript_send is not None and user_has_credits:
-                    transcript_send([segment.dict() for segment in transcript_segments])
+                    transcript_send([segment.dict() for segment in all_outgoing_segments])
                 elif not PUSHER_ENABLED and user_has_credits:
                     # Fallback: trigger realtime integrations directly when pusher is disabled
                     try:
                         await trigger_realtime_integrations(
-                            uid, [s.dict() for s in transcript_segments], current_conversation_id
+                            uid, [s.dict() for s in all_outgoing_segments], current_conversation_id
                         )
                     except Exception as e:
                         logger.error(f"Error triggering realtime integrations: {e} {uid} {session_id}")
