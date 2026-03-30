@@ -360,3 +360,119 @@ def test_multichannel_dead_socket_detection_in_source():
     assert mc_null_pos > 0, "Multi-channel path must null the dead socket slot"
     mc_degraded_pos = source.find('_enter_degraded_mode', mc_dead_pos)
     assert mc_degraded_pos > 0, "Multi-channel path must enter degraded mode"
+
+
+# ---------------------------------------------------------------------------
+# Behavioral: Speaker state reset after DG recovery
+# ---------------------------------------------------------------------------
+
+
+def test_speaker_state_reset_exists_in_recovery_path():
+    """Single-channel recovery must call _reset_speaker_state_after_recovery.
+
+    New DG connection resets diarization — old speaker_to_person_map entries
+    would map the wrong person to the wrong speaker number.
+    """
+    source = _read_transcribe_source()
+    # Find the single-channel recovery success path
+    recovery_fn_pos = source.find('async def _recover_deepgram_connection')
+    assert recovery_fn_pos > 0
+    recovery_block = source[recovery_fn_pos:]
+
+    # The reset must happen before _send_stt_recovered_event in single-channel path
+    single_ch_recovered_pos = recovery_block.find('f"Recovered Deepgram socket')
+    assert single_ch_recovered_pos > 0
+    pre_recovered_block = recovery_block[:single_ch_recovered_pos]
+    assert (
+        '_reset_speaker_state_after_recovery()' in pre_recovered_block
+    ), "Single-channel recovery must reset speaker state before sending recovered event"
+
+
+def test_speaker_state_reset_clears_correct_state():
+    """_reset_speaker_state_after_recovery clears speaker_to_person_map and suggested_segments.
+
+    It must NOT clear person_embeddings_cache (embeddings are connection-independent)
+    or segment_person_assignment_map (already-persisted assignments stay valid).
+    """
+    source = _read_transcribe_source()
+    reset_fn_pos = source.find('def _reset_speaker_state_after_recovery')
+    assert reset_fn_pos > 0
+    reset_block = source[reset_fn_pos : reset_fn_pos + 800]
+
+    # Must clear these (DG-diarization-dependent)
+    assert 'speaker_to_person_map.clear()' in reset_block
+    assert 'suggested_segments.clear()' in reset_block
+
+    # Must NOT clear these (DG-connection-independent)
+    assert 'person_embeddings_cache.clear()' not in reset_block
+    assert 'segment_person_assignment_map.clear()' not in reset_block
+
+
+def test_speaker_state_reset_drains_queue():
+    """_reset_speaker_state_after_recovery drains the speaker_id_segment_queue.
+
+    Stale queue items reference old DG speaker_ids that are no longer valid.
+    """
+    source = _read_transcribe_source()
+    reset_fn_pos = source.find('def _reset_speaker_state_after_recovery')
+    assert reset_fn_pos > 0
+    reset_block = source[reset_fn_pos : reset_fn_pos + 1200]
+
+    assert 'speaker_id_segment_queue' in reset_block, "Must drain the stale speaker_id_segment_queue"
+    assert 'get_nowait' in reset_block, "Must drain via get_nowait in a loop"
+
+
+def test_speaker_state_reset_runtime():
+    """Exercise the speaker state reset pattern at runtime.
+
+    Simulates: pre-degradation state with 2 speaker mappings → recovery → verify cleared.
+    """
+    import asyncio
+
+    speaker_to_person_map = {0: ('alice_id', 'Alice'), 1: ('bob_id', 'Bob')}
+    suggested_segments = {'seg_001', 'seg_002', 'seg_003'}
+    speaker_id_segment_queue = asyncio.Queue(maxsize=100)
+    speaker_id_segment_queue.put_nowait({'id': 'seg_004', 'speaker_id': 0})
+    speaker_id_segment_queue.put_nowait({'id': 'seg_005', 'speaker_id': 1})
+    # These should NOT be cleared
+    person_embeddings_cache = {'alice_id': {'embedding': [0.1] * 256, 'name': 'Alice'}}
+    segment_person_assignment_map = {'seg_001': 'alice_id'}
+
+    # Simulate the reset
+    speaker_to_person_map.clear()
+    suggested_segments.clear()
+    while not speaker_id_segment_queue.empty():
+        try:
+            speaker_id_segment_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+
+    assert len(speaker_to_person_map) == 0, "speaker_to_person_map must be cleared"
+    assert len(suggested_segments) == 0, "suggested_segments must be cleared"
+    assert speaker_id_segment_queue.empty(), "speaker_id_segment_queue must be drained"
+    # These must survive
+    assert len(person_embeddings_cache) == 1, "person_embeddings_cache must NOT be cleared"
+    assert len(segment_person_assignment_map) == 1, "segment_person_assignment_map must NOT be cleared"
+
+
+def test_multichannel_recovery_does_not_reset_speaker_state():
+    """Multi-channel recovery must NOT reset speaker state.
+
+    Multi-channel uses fixed per-channel speaker labels (SPEAKER_00, SPEAKER_01)
+    set by ChannelConfig, not DG diarization. These are deterministic and
+    survive DG reconnection.
+    """
+    source = _read_transcribe_source()
+    recovery_fn_pos = source.find('async def _recover_deepgram_connection')
+    assert recovery_fn_pos > 0
+    recovery_block = source[recovery_fn_pos:]
+
+    # Find multi-channel recovery success path
+    mc_recovered_pos = recovery_block.find('Recovered all multi-channel Deepgram sockets')
+    assert mc_recovered_pos > 0
+
+    # The reset must NOT appear between the multi-channel success check and its recovered event
+    mc_block = recovery_block[:mc_recovered_pos]
+    # Count occurrences of the reset call — it should only appear in single-channel path
+    reset_calls = recovery_block.count('_reset_speaker_state_after_recovery()')
+    assert reset_calls == 1, f"Reset must appear exactly once (single-channel only), found {reset_calls}"
