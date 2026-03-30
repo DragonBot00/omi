@@ -397,6 +397,7 @@ async def _stream_handler(
 
     locked_conversation_ids: Set[str] = set()
     speaker_to_person_map: Dict[int, Tuple[str, str]] = {}
+    speaker_map_epoch: int = 0  # Incremented on DG recovery; in-flight tasks check before writing
     segment_person_assignment_map: Dict[str, str] = {}
     current_session_segments: Dict[str, bool] = {}  # Store only speech_profile_processed status
     suggested_segments: Set[str] = set()
@@ -965,13 +966,17 @@ async def _stream_handler(
         person to the wrong speaker number, so we clear them and let the embedding-based
         identification re-learn the new assignments.
 
+        Increments speaker_map_epoch so in-flight _match_speaker_embedding tasks (spawned
+        before recovery) discard their results instead of writing stale speaker IDs back.
+
         We keep person_embeddings_cache (embeddings are connection-independent) and
         segment_person_assignment_map (already-persisted segment→person assignments).
         """
-        nonlocal speaker_map_dirty
+        nonlocal speaker_map_dirty, speaker_map_epoch
         old_count = len(speaker_to_person_map)
         speaker_to_person_map.clear()
         suggested_segments.clear()
+        speaker_map_epoch += 1
         # Drain stale items from the speaker_id_segment_queue (old speaker_ids)
         drained = 0
         while not speaker_id_segment_queue.empty():
@@ -982,13 +987,14 @@ async def _stream_handler(
                 break
         if old_count > 0 or drained > 0:
             speaker_map_dirty = True
-            logger.info(
-                'Speaker state reset after DG recovery: cleared %d speaker mappings, drained %d queue items %s %s',
-                old_count,
-                drained,
-                uid,
-                session_id,
-            )
+        logger.info(
+            'Speaker state reset after DG recovery: cleared %d mappings, drained %d queue items, epoch=%d %s %s',
+            old_count,
+            drained,
+            speaker_map_epoch,
+            uid,
+            session_id,
+        )
 
     async def _recover_deepgram_connection():
         nonlocal deepgram_socket
@@ -2041,14 +2047,14 @@ async def _stream_handler(
 
             duration = seg['duration']
             if duration >= SPEAKER_ID_MIN_AUDIO:
-                task = spawn(_match_speaker_embedding(speaker_id, seg))
+                task = spawn(_match_speaker_embedding(speaker_id, seg, epoch=speaker_map_epoch))
                 speaker_match_tasks.add(task)
                 task.add_done_callback(speaker_match_tasks.discard)
 
         logger.info(f"Speaker ID task ended {uid} {session_id}")
         speaker_id_done.set()
 
-    async def _match_speaker_embedding(speaker_id: int, segment: dict):
+    async def _match_speaker_embedding(speaker_id: int, segment: dict, epoch: int = 0):
         """Extract audio from ring buffer and match against stored embeddings."""
         nonlocal speaker_to_person_map, segment_person_assignment_map, audio_ring_buffer, speaker_map_dirty
 
@@ -2142,6 +2148,15 @@ async def _stream_handler(
                 if distance < best_distance:
                     best_distance = distance
                     best_match = (person_id, data['name'])
+
+            # Epoch guard: if DG recovered since this task was spawned, our speaker_id
+            # is from the old connection's diarization and must not pollute the new map.
+            if epoch != speaker_map_epoch:
+                logger.info(
+                    f"Speaker ID: discarding stale match for speaker {speaker_id} "
+                    f"(epoch {epoch} != {speaker_map_epoch}) {uid} {session_id}"
+                )
+                return
 
             if best_match and best_distance < SPEAKER_MATCH_THRESHOLD:
                 person_id, person_name = best_match
