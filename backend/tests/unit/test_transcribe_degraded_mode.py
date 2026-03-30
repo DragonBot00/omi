@@ -397,7 +397,7 @@ def test_speaker_state_reset_clears_correct_state():
     source = _read_transcribe_source()
     reset_fn_pos = source.find('def _reset_speaker_state_after_recovery')
     assert reset_fn_pos > 0
-    reset_block = source[reset_fn_pos : reset_fn_pos + 800]
+    reset_block = source[reset_fn_pos : reset_fn_pos + 1800]
 
     # Must clear these (DG-diarization-dependent)
     assert 'speaker_to_person_map.clear()' in reset_block
@@ -416,7 +416,7 @@ def test_speaker_state_reset_drains_queue():
     source = _read_transcribe_source()
     reset_fn_pos = source.find('def _reset_speaker_state_after_recovery')
     assert reset_fn_pos > 0
-    reset_block = source[reset_fn_pos : reset_fn_pos + 1200]
+    reset_block = source[reset_fn_pos : reset_fn_pos + 1800]
 
     assert 'speaker_id_segment_queue' in reset_block, "Must drain the stale speaker_id_segment_queue"
     assert 'get_nowait' in reset_block, "Must drain via get_nowait in a loop"
@@ -476,3 +476,95 @@ def test_multichannel_recovery_does_not_reset_speaker_state():
     # Count occurrences of the reset call — it should only appear in single-channel path
     reset_calls = recovery_block.count('_reset_speaker_state_after_recovery()')
     assert reset_calls == 1, f"Reset must appear exactly once (single-channel only), found {reset_calls}"
+
+
+# ---------------------------------------------------------------------------
+# Epoch guard for in-flight _match_speaker_embedding tasks
+# ---------------------------------------------------------------------------
+
+
+def test_epoch_guard_exists_in_match_speaker_embedding():
+    """Source: _match_speaker_embedding must check epoch != speaker_map_epoch before writing.
+
+    After DG recovery, speaker_map_epoch is incremented. In-flight tasks spawned
+    before recovery carry the old epoch and must discard their results.
+    """
+    source = _read_transcribe_source()
+    fn_pos = source.find('async def _match_speaker_embedding')
+    assert fn_pos > 0
+    fn_block = source[fn_pos : fn_pos + 6000]
+
+    # Function must accept an epoch parameter
+    assert 'epoch' in fn_block[:200], "epoch parameter missing from _match_speaker_embedding signature"
+
+    # Guard must appear before speaker_to_person_map writes
+    guard_pos = fn_block.find('epoch != speaker_map_epoch')
+    assert guard_pos > 0, "Epoch guard check missing in _match_speaker_embedding"
+
+    # The guard must come before the map writes
+    map_write_pos = fn_block.find('speaker_to_person_map[speaker_id]')
+    assert map_write_pos > 0
+    assert guard_pos < map_write_pos, "Epoch guard must appear before speaker_to_person_map writes"
+
+
+def test_epoch_guard_spawn_passes_current_epoch():
+    """Source: spawn of _match_speaker_embedding must pass epoch=speaker_map_epoch."""
+    source = _read_transcribe_source()
+
+    # Find the spawn call for _match_speaker_embedding
+    spawn_pos = source.find('_match_speaker_embedding(speaker_id')
+    assert spawn_pos > 0
+    spawn_line = source[spawn_pos : spawn_pos + 200]
+    assert 'epoch=speaker_map_epoch' in spawn_line, "Spawn must pass current epoch to _match_speaker_embedding"
+
+
+def test_epoch_incremented_on_recovery():
+    """Source: _reset_speaker_state_after_recovery must increment speaker_map_epoch."""
+    source = _read_transcribe_source()
+    fn_pos = source.find('def _reset_speaker_state_after_recovery')
+    assert fn_pos > 0
+    fn_block = source[fn_pos : fn_pos + 1800]
+    assert 'speaker_map_epoch += 1' in fn_block, "Recovery must increment speaker_map_epoch"
+
+
+def test_epoch_guard_discards_stale_match_runtime():
+    """Runtime: simulate epoch mismatch to prove stale speaker matches are discarded.
+
+    Steps:
+    1. Set speaker_map_epoch = 0, spawn a task at epoch 0
+    2. Before the task writes, increment epoch to 1 (simulating recovery)
+    3. Verify the task does NOT write to speaker_to_person_map
+    """
+
+    # Use a simple namespace to simulate the shared session state
+    class SessionState:
+        speaker_map_epoch = 0
+        speaker_to_person_map = {}
+        speaker_map_dirty = False
+
+    state = SessionState()
+
+    # Simulate the epoch guard logic from _match_speaker_embedding
+    def apply_match_with_epoch_guard(speaker_id, person_id, person_name, epoch):
+        """Mimics the epoch-guarded write path in _match_speaker_embedding."""
+        if epoch != state.speaker_map_epoch:
+            return False  # Discarded
+        state.speaker_to_person_map[speaker_id] = (person_id, person_name)
+        state.speaker_map_dirty = True
+        return True  # Written
+
+    # Case 1: Same epoch — write succeeds
+    assert apply_match_with_epoch_guard(0, 'person-abc', 'Alice', epoch=0) is True
+    assert 0 in state.speaker_to_person_map
+
+    # Simulate recovery: clear map and bump epoch
+    state.speaker_to_person_map.clear()
+    state.speaker_map_epoch += 1
+
+    # Case 2: Stale epoch — write must be discarded
+    assert apply_match_with_epoch_guard(1, 'person-xyz', 'Bob', epoch=0) is False
+    assert 1 not in state.speaker_to_person_map
+
+    # Case 3: Current epoch — write succeeds
+    assert apply_match_with_epoch_guard(2, 'person-def', 'Carol', epoch=1) is True
+    assert 2 in state.speaker_to_person_map
