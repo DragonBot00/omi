@@ -484,112 +484,114 @@ def test_multichannel_recovery_does_not_reset_speaker_state():
 
 
 def test_epoch_guard_exists_in_match_speaker_embedding():
-    """Source: _match_speaker_embedding must check epoch != speaker_map_epoch before writing.
+    """Source: _match_speaker_embedding must check stt_session != current_stt_session before writing.
 
-    After DG recovery, speaker_map_epoch is incremented. In-flight tasks spawned
-    before recovery carry the old epoch and must discard their results.
+    After DG recovery, current_stt_session is rotated to a new ULID. In-flight tasks spawned
+    before recovery carry the old session and must discard their results.
     """
     source = _read_transcribe_source()
     fn_pos = source.find('async def _match_speaker_embedding')
     assert fn_pos > 0
     fn_block = source[fn_pos : fn_pos + 6000]
 
-    # Function must accept an epoch parameter
-    assert 'epoch' in fn_block[:200], "epoch parameter missing from _match_speaker_embedding signature"
+    # Function must accept an stt_session parameter
+    assert 'stt_session' in fn_block[:200], "stt_session parameter missing from _match_speaker_embedding signature"
 
     # Guard must appear before speaker_to_person_map writes
-    guard_pos = fn_block.find('epoch != speaker_map_epoch')
-    assert guard_pos > 0, "Epoch guard check missing in _match_speaker_embedding"
+    guard_pos = fn_block.find('stt_session != current_stt_session')
+    assert guard_pos > 0, "Session guard check missing in _match_speaker_embedding"
 
     # The guard must come before the map writes
     map_write_pos = fn_block.find('speaker_to_person_map[speaker_id]')
     assert map_write_pos > 0
-    assert guard_pos < map_write_pos, "Epoch guard must appear before speaker_to_person_map writes"
+    assert guard_pos < map_write_pos, "Session guard must appear before speaker_to_person_map writes"
 
 
 def test_epoch_guard_spawn_passes_current_epoch():
-    """Source: spawn of _match_speaker_embedding must pass epoch=speaker_map_epoch."""
+    """Source: spawn of _match_speaker_embedding must pass stt_session=current_stt_session."""
     source = _read_transcribe_source()
 
     # Find the spawn call for _match_speaker_embedding
     spawn_pos = source.find('_match_speaker_embedding(speaker_id')
     assert spawn_pos > 0
     spawn_line = source[spawn_pos : spawn_pos + 200]
-    assert 'epoch=speaker_map_epoch' in spawn_line, "Spawn must pass current epoch to _match_speaker_embedding"
+    assert (
+        'stt_session=current_stt_session' in spawn_line
+    ), "Spawn must pass current stt_session to _match_speaker_embedding"
 
 
 def test_epoch_incremented_on_recovery():
-    """Source: _reset_speaker_state_after_recovery must increment speaker_map_epoch."""
+    """Source: _reset_speaker_state_after_recovery must rotate current_stt_session to a new ULID."""
     source = _read_transcribe_source()
     fn_pos = source.find('def _reset_speaker_state_after_recovery')
     assert fn_pos > 0
     fn_block = source[fn_pos : fn_pos + 1800]
-    assert 'speaker_map_epoch += 1' in fn_block, "Recovery must increment speaker_map_epoch"
+    assert 'current_stt_session = str(ULID())' in fn_block, "Recovery must rotate current_stt_session to new ULID"
 
 
-def test_epoch_guard_discards_stale_match_runtime():
-    """Runtime: simulate epoch mismatch to prove stale speaker matches are discarded.
+def test_session_guard_discards_stale_match_runtime():
+    """Runtime: simulate stt_session mismatch to prove stale speaker matches are discarded.
 
     Steps:
-    1. Set speaker_map_epoch = 0, spawn a task at epoch 0
-    2. Before the task writes, increment epoch to 1 (simulating recovery)
+    1. Set current_stt_session = 'ses-A', spawn a task with 'ses-A'
+    2. Before the task writes, rotate session to 'ses-B' (simulating recovery)
     3. Verify the task does NOT write to speaker_to_person_map
     """
 
     # Use a simple namespace to simulate the shared session state
     class SessionState:
-        speaker_map_epoch = 0
+        current_stt_session = 'ses-A'
         speaker_to_person_map = {}
         speaker_map_dirty = False
 
     state = SessionState()
 
-    # Simulate the epoch guard logic from _match_speaker_embedding
-    def apply_match_with_epoch_guard(speaker_id, person_id, person_name, epoch):
-        """Mimics the epoch-guarded write path in _match_speaker_embedding."""
-        if epoch != state.speaker_map_epoch:
+    # Simulate the session guard logic from _match_speaker_embedding
+    def apply_match_with_session_guard(speaker_id, person_id, person_name, stt_session):
+        """Mimics the session-guarded write path in _match_speaker_embedding."""
+        if stt_session != state.current_stt_session:
             return False  # Discarded
         state.speaker_to_person_map[speaker_id] = (person_id, person_name)
         state.speaker_map_dirty = True
         return True  # Written
 
-    # Case 1: Same epoch — write succeeds
-    assert apply_match_with_epoch_guard(0, 'person-abc', 'Alice', epoch=0) is True
+    # Case 1: Same session — write succeeds
+    assert apply_match_with_session_guard(0, 'person-abc', 'Alice', stt_session='ses-A') is True
     assert 0 in state.speaker_to_person_map
 
-    # Simulate recovery: clear map and bump epoch
+    # Simulate recovery: clear map and rotate session
     state.speaker_to_person_map.clear()
-    state.speaker_map_epoch += 1
+    state.current_stt_session = 'ses-B'
 
-    # Case 2: Stale epoch — write must be discarded
-    assert apply_match_with_epoch_guard(1, 'person-xyz', 'Bob', epoch=0) is False
+    # Case 2: Stale session — write must be discarded
+    assert apply_match_with_session_guard(1, 'person-xyz', 'Bob', stt_session='ses-A') is False
     assert 1 not in state.speaker_to_person_map
 
-    # Case 3: Current epoch — write succeeds
-    assert apply_match_with_epoch_guard(2, 'person-def', 'Carol', epoch=1) is True
+    # Case 3: Current session — write succeeds
+    assert apply_match_with_session_guard(2, 'person-def', 'Carol', stt_session='ses-B') is True
     assert 2 in state.speaker_to_person_map
 
 
 # ---------------------------------------------------------------------------
-# Buffer-level epoch tagging (stale segments from old DG connection)
+# Buffer-level session tagging (segments from old DG connection)
 # ---------------------------------------------------------------------------
 
 
 def test_dg_callback_pins_epoch_at_creation():
-    """Source: _make_dg_transcript_callback must capture generation at creation time (not at callback time).
+    """Source: _make_dg_transcript_callback must capture stt_session at creation time (not at callback time).
 
     This ensures old DG sockets that fire late callbacks tag segments with the
-    OLD generation, not the current one — so they get stt_provider='deepgram:stale'.
+    OLD stt_session, not the current one — so they act as a merge barrier.
     """
     source = _read_transcribe_source()
     fn_pos = source.find('def _make_dg_transcript_callback')
     assert fn_pos > 0
     fn_block = source[fn_pos : fn_pos + 600]
-    # Must capture generation in outer scope (pinned), not read mutable speaker_map_epoch in inner cb
+    # Must capture session in outer scope (pinned), not read mutable current_stt_session in inner cb
     assert (
-        'pinned_generation = speaker_map_epoch' in fn_block
-    ), "_make_dg_transcript_callback must pin generation at creation time"
-    assert "_dg_generation" in fn_block, "DG callback must tag segments with _dg_generation"
+        'pinned_session = current_stt_session' in fn_block
+    ), "_make_dg_transcript_callback must pin stt_session at creation time"
+    assert "stt_session" in fn_block, "DG callback must tag segments with stt_session"
 
 
 def test_dg_callback_used_for_connections():
@@ -606,160 +608,124 @@ def test_dg_callback_used_for_connections():
 
 
 def test_multi_channel_callback_pins_epoch():
-    """Source: multi-channel callback must pin generation at creation time."""
+    """Source: multi-channel callback must pin stt_session at creation time."""
     source = _read_transcribe_source()
     fn_pos = source.find('def make_multi_channel_callback')
     assert fn_pos > 0
     fn_block = source[fn_pos : fn_pos + 600]
     assert (
-        'pinned_generation = speaker_map_epoch' in fn_block
-    ), "make_multi_channel_callback must pin generation at creation time"
-    assert "_dg_generation" in fn_block, "multi-channel callback must tag segments with _dg_generation"
+        'pinned_session = current_stt_session' in fn_block
+    ), "make_multi_channel_callback must pin stt_session at creation time"
+    assert "stt_session" in fn_block, "multi-channel callback must tag segments with stt_session"
 
 
 def test_stale_segments_excluded_from_combine():
-    """Source: stale segments get stt_provider='deepgram:stale' which acts as a merge barrier.
+    """Source: stt_session field on TranscriptSegment acts as a merge barrier in combine_segments.
 
-    The stt_provider mismatch in combine_segments (line 145 of transcript_segment.py)
-    prevents stale segments from merging with fresh segments at ALL call sites —
-    no separate list or parameter needed.
+    The stt_session mismatch in combine_segments._merge prevents segments from
+    different DG connections from merging — no separate list or stale tagging needed.
+    """
+    from models.transcript_segment import TranscriptSegment
+
+    # Verify stt_session field exists on the model
+    seg = TranscriptSegment(text='test', is_user=False, start=0.0, end=1.0, stt_session='session-A')
+    assert seg.stt_session == 'session-A', "TranscriptSegment must accept stt_session field"
+
+    # Verify merge barrier: same session merges, different session blocks
+    seg_a = TranscriptSegment(text='hello', speaker='SPEAKER_0', is_user=False, start=0.0, end=1.0, stt_session='ses-1')
+    seg_b = TranscriptSegment(text='world', speaker='SPEAKER_0', is_user=False, start=1.0, end=2.0, stt_session='ses-1')
+    result, _, _ = TranscriptSegment.combine_segments([], [seg_a, seg_b])
+    assert len(result) == 1, "Same stt_session segments should merge"
+
+    seg_c = TranscriptSegment(text='hello', speaker='SPEAKER_0', is_user=False, start=0.0, end=1.0, stt_session='ses-1')
+    seg_d = TranscriptSegment(text='world', speaker='SPEAKER_0', is_user=False, start=1.0, end=2.0, stt_session='ses-2')
+    result2, _, _ = TranscriptSegment.combine_segments([], [seg_c, seg_d])
+    assert len(result2) == 2, "Different stt_session segments must NOT merge (merge barrier)"
+
+
+def test_stt_session_flows_through_to_transcript_segment():
+    """Source: stt_session set by callback flows directly into TranscriptSegment (no pop needed).
+
+    Unlike the old _dg_generation approach, stt_session is a proper model field on
+    TranscriptSegment, so it flows through **s unpacking without needing to be popped.
     """
     source = _read_transcribe_source()
-    process_pos = source.find('async def stream_transcript_process')
-    assert process_pos > 0
-    process_block = source[process_pos : process_pos + 6000]
+    # The callback must set stt_session on segments
+    cb_pos = source.find('def _make_dg_transcript_callback')
+    assert cb_pos > 0
+    cb_block = source[cb_pos : cb_pos + 600]
+    assert "stt_session" in cb_block, "DG callback must set stt_session on segments"
 
-    # Stale segments must have speaker neutralized
-    assert 'segment.speaker = None' in process_block, "Stale segments must have speaker set to None"
-    assert 'segment.speaker_id = None' in process_block, "Stale segments must have speaker_id set to None"
-
-    # Stale segments get different stt_provider to prevent merge
-    assert (
-        "stt_provider = 'deepgram:stale'" in process_block
-    ), "Stale segments must get stt_provider='deepgram:stale' as merge barrier"
-    # Fresh segments also get stt_provider set
-    assert "stt_provider = 'deepgram'" in process_block, "Fresh segments must get stt_provider='deepgram'"
-
-    # All segments go through single combine_segments call
-    combine_pos = process_block.find('.combine_segments(')
-    assert combine_pos > 0
-    combine_line = process_block[combine_pos : combine_pos + 100]
-    assert 'processed_segments' in combine_line, "combine_segments receives all processed segments"
+    # stt_session should NOT be popped (it's a model field)
+    assert "s.pop('stt_session'" not in source, "stt_session must NOT be popped — it's a TranscriptSegment field"
 
 
-def test_dg_generation_popped_before_transcript_segment():
-    """Source: _dg_generation must be popped from raw dict before TranscriptSegment conversion."""
-    source = _read_transcribe_source()
-    # Find the TranscriptSegment conversion in stream_transcript_process
-    conv_pos = source.find("s.pop('_dg_generation'")
-    assert conv_pos > 0, "_dg_generation must be popped from segment dict before TranscriptSegment(**s)"
-    ts_pos = source.find('TranscriptSegment(**s', conv_pos)
-    assert ts_pos > conv_pos, "TranscriptSegment conversion must come AFTER _dg_generation pop"
-
-
-def test_stale_segments_speaker_neutralized_at_runtime():
-    """Runtime: simulate stale segments to prove their speaker is neutralized.
+def test_stale_session_segments_skipped_by_speaker_detection():
+    """Runtime: segments with old stt_session are skipped by speaker detection loop.
 
     Steps:
-    1. Two segments buffered at epoch 0 (old DG)
-    2. Recovery bumps epoch to 1
-    3. One new segment arrives at epoch 1
-    4. Processing must neutralize speaker on epoch-0 segments but keep epoch-1 intact
-    5. Neutralized segments are skipped by speaker detection (speaker_id is None)
+    1. Two segments from old DG connection carry stt_session='ses-old'
+    2. Recovery rotates current_stt_session to 'ses-new'
+    3. One new segment arrives with stt_session='ses-new'
+    4. Speaker detection loop skips old-session segments
     """
-    speaker_map_epoch = 1  # Recovery already happened
+    from models.transcript_segment import TranscriptSegment
 
-    raw_segments = [
-        {
-            'text': 'hello from old DG',
-            'speaker': 'SPEAKER_0',
-            'is_user': False,
-            'start': 0.0,
-            'end': 1.0,
-            '_dg_generation': 0,
-        },
-        {
-            'text': 'old segment two',
-            'speaker': 'SPEAKER_1',
-            'is_user': False,
-            'start': 1.0,
-            'end': 2.0,
-            '_dg_generation': 0,
-        },
-        {
-            'text': 'new DG segment',
-            'speaker': 'SPEAKER_0',
-            'is_user': False,
-            'start': 2.0,
-            'end': 3.0,
-            '_dg_generation': 1,
-        },
+    current_stt_session = 'ses-new'
+
+    segments = [
+        TranscriptSegment(
+            text='hello from old DG', speaker='SPEAKER_0', is_user=False, start=0.0, end=1.0, stt_session='ses-old'
+        ),
+        TranscriptSegment(
+            text='old segment two', speaker='SPEAKER_1', is_user=False, start=1.0, end=2.0, stt_session='ses-old'
+        ),
+        TranscriptSegment(
+            text='new DG segment', speaker='SPEAKER_0', is_user=False, start=2.0, end=3.0, stt_session='ses-new'
+        ),
     ]
 
-    # Simulate the processing logic: pop epoch, neutralize stale speakers
-    class Segment:
-        def __init__(self, text, speaker, speaker_id, is_user):
-            self.text = text
-            self.speaker = speaker
-            self.speaker_id = speaker_id
-            self.is_user = is_user
+    # Simulate the speaker detection loop guard from stream_transcript_process
+    speaker_ops = []
+    for segment in segments:
+        if segment.stt_session and segment.stt_session != current_stt_session:
+            continue
+        speaker_ops.append(segment.text)
 
-    segments = []
-    for s in raw_segments:
-        seg_epoch = s.pop('_dg_generation', speaker_map_epoch)
-        seg = Segment(s['text'], s['speaker'], int(s['speaker'].split('_')[1]), s['is_user'])
-        if seg_epoch != speaker_map_epoch:
-            seg.speaker = None
-            seg.speaker_id = None
-        segments.append(seg)
-
-    # Epoch-0 segments should have neutralized speakers
-    assert segments[0].speaker is None
-    assert segments[0].speaker_id is None
-    assert segments[0].text == 'hello from old DG'  # text preserved
-    assert segments[1].speaker is None
-    assert segments[1].speaker_id is None
-
-    # Epoch-1 segment should keep its speaker
-    assert segments[2].speaker == 'SPEAKER_0'
-    assert segments[2].speaker_id == 0
-
-    # Simulate speaker detection: only segments with speaker_id != None proceed
-    speaker_ops = [s.text for s in segments if s.speaker_id is not None]
-    assert speaker_ops == ['new DG segment']
+    assert speaker_ops == ['new DG segment'], "Only current-session segments should reach speaker detection"
 
 
-def test_late_old_socket_callback_tagged_stale():
-    """Runtime: old DG socket fires late callback after recovery — segment must be tagged stale.
+def test_late_old_socket_callback_tagged_with_old_session():
+    """Runtime: old DG socket fires late callback after recovery — segment carries old stt_session.
 
     Regression test for the race: old socket emits a transcript after recovery
-    bumps speaker_map_epoch. If the callback reads the *current* mutable epoch
-    instead of a pinned one, the segment gets the new epoch and bypasses the
-    stale guard. The pinned-epoch callback factory prevents this.
+    rotates current_stt_session. If the callback reads the *current* mutable session
+    instead of a pinned one, the segment gets the new session and bypasses the
+    session guard. The pinned-session callback factory prevents this.
     """
     from collections import deque
 
     buffer = deque(maxlen=100)
-    current_epoch = 0
+    current_session = 'ses-A'
 
-    # Simulate _make_dg_transcript_callback — pins epoch at creation time
+    # Simulate _make_dg_transcript_callback — pins session at creation time
     def make_pinned_callback():
-        pinned = current_epoch
+        pinned = current_session
 
         def cb(segments):
             for seg in segments:
-                seg['_dg_generation'] = pinned
+                seg['stt_session'] = pinned
             buffer.extend(segments)
 
         return cb
 
-    # Create callback at epoch 0 (old DG connection)
+    # Create callback at session A (old DG connection)
     old_callback = make_pinned_callback()
 
-    # Recovery: bump epoch
-    current_epoch = 1
+    # Recovery: rotate session
+    current_session = 'ses-B'
 
-    # Create callback for new DG connection at epoch 1
+    # Create callback for new DG connection at session B
     new_callback = make_pinned_callback()
 
     # Old socket fires late callback AFTER recovery
@@ -769,77 +735,73 @@ def test_late_old_socket_callback_tagged_stale():
 
     segments = list(buffer)
     assert len(segments) == 2
-    # Old callback segment must have old epoch (0), not current (1)
+    # Old callback segment must have old session, not current
     assert (
-        segments[0]['_dg_generation'] == 0
-    ), f"Late old-socket segment should have epoch 0, got {segments[0]['_dg_generation']}"
-    # New callback segment has current epoch
-    assert segments[1]['_dg_generation'] == 1
+        segments[0]['stt_session'] == 'ses-A'
+    ), f"Late old-socket segment should have ses-A, got {segments[0]['stt_session']}"
+    # New callback segment has current session
+    assert segments[1]['stt_session'] == 'ses-B'
 
-    # Filtering: only epoch-1 segments pass the stale guard
-    fresh = [s for s in segments if s['_dg_generation'] == current_epoch]
+    # Filtering: only current-session segments pass the session guard
+    fresh = [s for s in segments if s['stt_session'] == current_session]
     assert len(fresh) == 1
     assert fresh[0]['text'] == 'from new DG'
 
 
-def test_stale_segment_excluded_from_combine_prevents_all_merges():
-    """Regression: stale segments excluded from combine_segments can't merge at all.
+def test_stt_session_barrier_prevents_all_merges():
+    """Regression: stt_session mismatch prevents merge through all combine_segments paths.
 
-    Without exclusion, stale segments can merge through multiple paths:
+    Without the barrier, segments can merge through multiple paths:
     - Same speaker: a.speaker == b.speaker
     - is_user: a.is_user and b.is_user (e.g., onboarding mode)
     - Lowercase continuation: is_user match + lowercase start
 
-    By keeping stale segments in a separate list and appending after combine,
-    they never enter any merge predicate.
+    The stt_session mismatch in _merge blocks all of these.
     """
     from models.transcript_segment import TranscriptSegment
 
-    # Existing tail: SPEAKER_0, is_user=True
-    existing = [TranscriptSegment(text='hello', speaker='SPEAKER_0', is_user=True, start=0.0, end=1.0)]
+    # Existing tail: SPEAKER_0, is_user=True, session A
+    existing = [
+        TranscriptSegment(text='hello', speaker='SPEAKER_0', is_user=True, start=0.0, end=1.0, stt_session='ses-A')
+    ]
 
-    # Stale segment: neutralized speaker + different stt_provider
-    stale = TranscriptSegment(text='late from old DG', speaker='SPEAKER_0', is_user=True, start=1.5, end=2.5)
-    stale.speaker = None
-    stale.speaker_id = None
-    stale.stt_provider = 'deepgram:stale'
+    # Without session barrier, same session would cause merge
+    same_session = TranscriptSegment(
+        text='no barrier', speaker='SPEAKER_0', is_user=True, start=1.5, end=2.5, stt_session='ses-A'
+    )
+    combined_same, _, _ = TranscriptSegment.combine_segments([], existing + [same_session])
+    assert len(combined_same) == 1, "Same stt_session segments merge normally"
 
-    # Without stt_provider barrier, same is_user would cause merge
-    no_barrier = TranscriptSegment(text='no barrier', speaker='SPEAKER_0', is_user=True, start=1.5, end=2.5)
-    no_barrier.speaker = None
-    no_barrier.speaker_id = None
-    # no_barrier has stt_provider=None (same as existing), so it merges
-    combined_no_barrier, _, _ = TranscriptSegment.combine_segments([], existing + [no_barrier])
-    assert len(combined_no_barrier) == 1, "Without stt_provider barrier, segments merge"
-
-    # With stt_provider='deepgram:stale', merge is blocked at ALL call sites
-    combined, _, _ = TranscriptSegment.combine_segments([], existing + [stale])
-    assert len(combined) == 2, f"stt_provider mismatch must prevent merge, got {len(combined)}"
-    assert combined[1].speaker is None, "Stale segment keeps neutralized speaker"
-    assert combined[1].stt_provider == 'deepgram:stale', "Stale segment keeps its stt_provider"
+    # With different stt_session, merge is blocked at ALL paths
+    diff_session = TranscriptSegment(
+        text='from new DG', speaker='SPEAKER_0', is_user=True, start=1.5, end=2.5, stt_session='ses-B'
+    )
+    combined, _, _ = TranscriptSegment.combine_segments([], existing + [diff_session])
+    assert len(combined) == 2, f"stt_session mismatch must prevent merge, got {len(combined)}"
+    assert combined[0].stt_session == 'ses-A'
+    assert combined[1].stt_session == 'ses-B'
 
 
-def test_stt_provider_barrier_works_at_persisted_tail():
-    """Regression: stt_provider mismatch prevents merge at conversation-tail combine too.
+def test_stt_session_barrier_works_at_persisted_tail():
+    """Regression: stt_session mismatch prevents merge at conversation-tail combine too.
 
     _update_in_progress_conversation calls combine_segments(conversation.transcript_segments, segments).
-    The stt_provider='deepgram:stale' barrier works at this second call site automatically.
+    The stt_session mismatch barrier works at this second call site automatically.
     """
     from models.transcript_segment import TranscriptSegment
 
-    # Existing conversation tail with is_user=True, stt_provider='deepgram'
-    tail = TranscriptSegment(text='hello world', speaker='SPEAKER_0', is_user=True, start=0.0, end=1.0)
-    tail.stt_provider = 'deepgram'
+    # Existing conversation tail with stt_session A
+    tail = TranscriptSegment(
+        text='hello world', speaker='SPEAKER_0', is_user=True, start=0.0, end=1.0, stt_session='ses-A'
+    )
 
-    # Stale segment with different stt_provider
-    stale = TranscriptSegment(text='late from old DG', speaker='SPEAKER_0', is_user=True, start=1.5, end=2.5)
-    stale.speaker = None
-    stale.speaker_id = None
-    stale.stt_provider = 'deepgram:stale'
+    # New segment from different DG connection with stt_session B
+    new_seg = TranscriptSegment(
+        text='from new DG', speaker='SPEAKER_0', is_user=True, start=1.5, end=2.5, stt_session='ses-B'
+    )
 
-    # combine_segments blocks merge due to stt_provider mismatch
-    combined, _, _ = TranscriptSegment.combine_segments([tail], [stale])
-    assert len(combined) == 2, f"stt_provider barrier must prevent persisted-tail merge, got {len(combined)}"
+    # combine_segments blocks merge due to stt_session mismatch
+    combined, _, _ = TranscriptSegment.combine_segments([tail], [new_seg])
+    assert len(combined) == 2, f"stt_session barrier must prevent persisted-tail merge, got {len(combined)}"
     assert combined[0].text == 'hello world', "Original tail unchanged"
-    assert combined[1].speaker is None, "Stale segment keeps neutralized speaker"
-    assert combined[1].stt_provider == 'deepgram:stale', "Stale provider preserved"
+    assert combined[1].stt_session == 'ses-B', "New segment keeps its stt_session"
