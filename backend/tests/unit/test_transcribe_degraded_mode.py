@@ -576,20 +576,20 @@ def test_epoch_guard_discards_stale_match_runtime():
 
 
 def test_dg_callback_pins_epoch_at_creation():
-    """Source: _make_dg_transcript_callback must capture epoch at creation time (not at callback time).
+    """Source: _make_dg_transcript_callback must capture generation at creation time (not at callback time).
 
     This ensures old DG sockets that fire late callbacks tag segments with the
-    OLD epoch, not the current one — so they are correctly identified as stale.
+    OLD generation, not the current one — so they get stt_provider='deepgram:stale'.
     """
     source = _read_transcribe_source()
     fn_pos = source.find('def _make_dg_transcript_callback')
     assert fn_pos > 0
     fn_block = source[fn_pos : fn_pos + 600]
-    # Must capture epoch in outer scope (pinned), not read mutable speaker_map_epoch in inner cb
+    # Must capture generation in outer scope (pinned), not read mutable speaker_map_epoch in inner cb
     assert (
-        'pinned_epoch = speaker_map_epoch' in fn_block
-    ), "_make_dg_transcript_callback must pin epoch at creation time"
-    assert "_stt_epoch" in fn_block, "DG callback must tag segments with _stt_epoch"
+        'pinned_generation = speaker_map_epoch' in fn_block
+    ), "_make_dg_transcript_callback must pin generation at creation time"
+    assert "_dg_generation" in fn_block, "DG callback must tag segments with _dg_generation"
 
 
 def test_dg_callback_used_for_connections():
@@ -606,67 +606,55 @@ def test_dg_callback_used_for_connections():
 
 
 def test_multi_channel_callback_pins_epoch():
-    """Source: multi-channel callback must pin epoch at creation time."""
+    """Source: multi-channel callback must pin generation at creation time."""
     source = _read_transcribe_source()
     fn_pos = source.find('def make_multi_channel_callback')
     assert fn_pos > 0
     fn_block = source[fn_pos : fn_pos + 600]
-    assert 'pinned_epoch = speaker_map_epoch' in fn_block, "make_multi_channel_callback must pin epoch at creation time"
-    assert "_stt_epoch" in fn_block, "multi-channel callback must tag segments with _stt_epoch"
+    assert (
+        'pinned_generation = speaker_map_epoch' in fn_block
+    ), "make_multi_channel_callback must pin generation at creation time"
+    assert "_dg_generation" in fn_block, "multi-channel callback must tag segments with _dg_generation"
 
 
 def test_stale_segments_excluded_from_combine():
-    """Source: stale segments must be separated from newly_processed_segments before combine_segments.
+    """Source: stale segments get stt_provider='deepgram:stale' which acts as a merge barrier.
 
-    Stale segments are kept in a separate list (stale_dg_segments) and passed separately
-    to _update_in_progress_conversation via the stale_segments parameter. This ensures they
-    bypass BOTH combine_segments calls (in stream_transcript_process AND in
-    _update_in_progress_conversation). Speaker is also neutralized so speaker detection
-    naturally skips them.
+    The stt_provider mismatch in combine_segments (line 145 of transcript_segment.py)
+    prevents stale segments from merging with fresh segments at ALL call sites —
+    no separate list or parameter needed.
     """
     source = _read_transcribe_source()
     process_pos = source.find('async def stream_transcript_process')
     assert process_pos > 0
     process_block = source[process_pos : process_pos + 6000]
 
-    # Must have separate stale list
-    assert 'stale_dg_segments' in process_block, "Must collect stale segments in separate list"
-
     # Stale segments must have speaker neutralized
     assert 'segment.speaker = None' in process_block, "Stale segments must have speaker set to None"
     assert 'segment.speaker_id = None' in process_block, "Stale segments must have speaker_id set to None"
 
-    # combine_segments must only receive newly_processed_segments (not stale)
+    # Stale segments get different stt_provider to prevent merge
+    assert (
+        "stt_provider = 'deepgram:stale'" in process_block
+    ), "Stale segments must get stt_provider='deepgram:stale' as merge barrier"
+    # Fresh segments also get stt_provider set
+    assert "stt_provider = 'deepgram'" in process_block, "Fresh segments must get stt_provider='deepgram'"
+
+    # All segments go through single combine_segments call
     combine_pos = process_block.find('.combine_segments(')
     assert combine_pos > 0
     combine_line = process_block[combine_pos : combine_pos + 100]
-    assert 'newly_processed_segments' in combine_line, "combine_segments must only receive fresh segments"
-    assert 'stale_dg_segments' not in combine_line, "combine_segments must NOT receive stale segments"
-
-    # Stale segments must be passed separately to _update_in_progress_conversation
-    assert (
-        'stale_segments=stale_dg_segments' in process_block
-    ), "Stale segments must be passed via stale_segments parameter to bypass both combine_segments calls"
-
-    # _update_in_progress_conversation must accept and handle stale_segments parameter
-    update_fn_pos = source.find('def _update_in_progress_conversation')
-    assert update_fn_pos > 0
-    update_fn_block = source[update_fn_pos : update_fn_pos + 1000]
-    assert 'stale_segments' in update_fn_block, "_update_in_progress_conversation must accept stale_segments parameter"
-    # Stale segments appended after combine_segments inside _update_in_progress_conversation
-    assert (
-        '.extend(stale_segments)' in update_fn_block
-    ), "Stale segments must be appended after combine in _update_in_progress_conversation"
+    assert 'processed_segments' in combine_line, "combine_segments receives all processed segments"
 
 
-def test_stt_epoch_popped_before_transcript_segment():
-    """Source: _stt_epoch must be popped from raw dict before TranscriptSegment conversion."""
+def test_dg_generation_popped_before_transcript_segment():
+    """Source: _dg_generation must be popped from raw dict before TranscriptSegment conversion."""
     source = _read_transcribe_source()
     # Find the TranscriptSegment conversion in stream_transcript_process
-    conv_pos = source.find("s.pop('_stt_epoch'")
-    assert conv_pos > 0, "_stt_epoch must be popped from segment dict before TranscriptSegment(**s)"
+    conv_pos = source.find("s.pop('_dg_generation'")
+    assert conv_pos > 0, "_dg_generation must be popped from segment dict before TranscriptSegment(**s)"
     ts_pos = source.find('TranscriptSegment(**s', conv_pos)
-    assert ts_pos > conv_pos, "TranscriptSegment conversion must come AFTER _stt_epoch pop"
+    assert ts_pos > conv_pos, "TranscriptSegment conversion must come AFTER _dg_generation pop"
 
 
 def test_stale_segments_speaker_neutralized_at_runtime():
@@ -688,7 +676,7 @@ def test_stale_segments_speaker_neutralized_at_runtime():
             'is_user': False,
             'start': 0.0,
             'end': 1.0,
-            '_stt_epoch': 0,
+            '_dg_generation': 0,
         },
         {
             'text': 'old segment two',
@@ -696,9 +684,16 @@ def test_stale_segments_speaker_neutralized_at_runtime():
             'is_user': False,
             'start': 1.0,
             'end': 2.0,
-            '_stt_epoch': 0,
+            '_dg_generation': 0,
         },
-        {'text': 'new DG segment', 'speaker': 'SPEAKER_0', 'is_user': False, 'start': 2.0, 'end': 3.0, '_stt_epoch': 1},
+        {
+            'text': 'new DG segment',
+            'speaker': 'SPEAKER_0',
+            'is_user': False,
+            'start': 2.0,
+            'end': 3.0,
+            '_dg_generation': 1,
+        },
     ]
 
     # Simulate the processing logic: pop epoch, neutralize stale speakers
@@ -711,7 +706,7 @@ def test_stale_segments_speaker_neutralized_at_runtime():
 
     segments = []
     for s in raw_segments:
-        seg_epoch = s.pop('_stt_epoch', speaker_map_epoch)
+        seg_epoch = s.pop('_dg_generation', speaker_map_epoch)
         seg = Segment(s['text'], s['speaker'], int(s['speaker'].split('_')[1]), s['is_user'])
         if seg_epoch != speaker_map_epoch:
             seg.speaker = None
@@ -753,7 +748,7 @@ def test_late_old_socket_callback_tagged_stale():
 
         def cb(segments):
             for seg in segments:
-                seg['_stt_epoch'] = pinned
+                seg['_dg_generation'] = pinned
             buffer.extend(segments)
 
         return cb
@@ -776,13 +771,13 @@ def test_late_old_socket_callback_tagged_stale():
     assert len(segments) == 2
     # Old callback segment must have old epoch (0), not current (1)
     assert (
-        segments[0]['_stt_epoch'] == 0
-    ), f"Late old-socket segment should have epoch 0, got {segments[0]['_stt_epoch']}"
+        segments[0]['_dg_generation'] == 0
+    ), f"Late old-socket segment should have epoch 0, got {segments[0]['_dg_generation']}"
     # New callback segment has current epoch
-    assert segments[1]['_stt_epoch'] == 1
+    assert segments[1]['_dg_generation'] == 1
 
     # Filtering: only epoch-1 segments pass the stale guard
-    fresh = [s for s in segments if s['_stt_epoch'] == current_epoch]
+    fresh = [s for s in segments if s['_dg_generation'] == current_epoch]
     assert len(fresh) == 1
     assert fresh[0]['text'] == 'from new DG'
 
@@ -803,67 +798,48 @@ def test_stale_segment_excluded_from_combine_prevents_all_merges():
     # Existing tail: SPEAKER_0, is_user=True
     existing = [TranscriptSegment(text='hello', speaker='SPEAKER_0', is_user=True, start=0.0, end=1.0)]
 
-    # Stale segment: neutralized speaker=None, but is_user=True (from onboarding)
-    # Must set speaker/speaker_id after construction (TranscriptSegment.__init__ derives speaker_id)
+    # Stale segment: neutralized speaker + different stt_provider
     stale = TranscriptSegment(text='late from old DG', speaker='SPEAKER_0', is_user=True, start=1.5, end=2.5)
     stale.speaker = None
     stale.speaker_id = None
+    stale.stt_provider = 'deepgram:stale'
 
-    # If stale were fed into combine_segments, it could merge via is_user path
-    combined_with_stale, _, _ = TranscriptSegment.combine_segments([], existing + [stale])
-    # This would merge them (is_user and is_user) — the bug we're preventing
-    merged_count = len(combined_with_stale)
+    # Without stt_provider barrier, same is_user would cause merge
+    no_barrier = TranscriptSegment(text='no barrier', speaker='SPEAKER_0', is_user=True, start=1.5, end=2.5)
+    no_barrier.speaker = None
+    no_barrier.speaker_id = None
+    # no_barrier has stt_provider=None (same as existing), so it merges
+    combined_no_barrier, _, _ = TranscriptSegment.combine_segments([], existing + [no_barrier])
+    assert len(combined_no_barrier) == 1, "Without stt_provider barrier, segments merge"
 
-    # With the fix: exclude stale from combine, append after
-    combined_fresh, _, _ = TranscriptSegment.combine_segments([], existing)
-    combined_fresh.append(stale)
-    # Stale segment stays separate — no merge leakage
-    assert len(combined_fresh) == 2, f"Stale segment must stay separate, got {len(combined_fresh)}"
-    assert combined_fresh[1].speaker is None, "Stale segment must keep neutralized speaker"
-    assert combined_fresh[1].speaker_id is None, "Stale segment must keep neutralized speaker_id"
+    # With stt_provider='deepgram:stale', merge is blocked at ALL call sites
+    combined, _, _ = TranscriptSegment.combine_segments([], existing + [stale])
+    assert len(combined) == 2, f"stt_provider mismatch must prevent merge, got {len(combined)}"
+    assert combined[1].speaker is None, "Stale segment keeps neutralized speaker"
+    assert combined[1].stt_provider == 'deepgram:stale', "Stale segment keeps its stt_provider"
 
 
-def test_stale_segments_bypass_persisted_tail_combine():
-    """Regression: stale segments must also bypass combine_segments in _update_in_progress_conversation.
+def test_stt_provider_barrier_works_at_persisted_tail():
+    """Regression: stt_provider mismatch prevents merge at conversation-tail combine too.
 
     _update_in_progress_conversation calls combine_segments(conversation.transcript_segments, segments).
-    If stale segments are included in `segments`, they merge with the existing conversation tail
-    via the is_user path — even after being excluded from the first combine in stream_transcript_process.
-
-    The fix passes stale segments via a separate `stale_segments` parameter so they are appended
-    after both combine_segments calls.
+    The stt_provider='deepgram:stale' barrier works at this second call site automatically.
     """
     from models.transcript_segment import TranscriptSegment
 
-    # Simulate existing conversation tail with is_user=True
-    conversation_tail = [TranscriptSegment(text='hello world', speaker='SPEAKER_0', is_user=True, start=0.0, end=1.0)]
+    # Existing conversation tail with is_user=True, stt_provider='deepgram'
+    tail = TranscriptSegment(text='hello world', speaker='SPEAKER_0', is_user=True, start=0.0, end=1.0)
+    tail.stt_provider = 'deepgram'
 
-    # Stale segment: neutralized but would merge via is_user if fed to combine_segments
+    # Stale segment with different stt_provider
     stale = TranscriptSegment(text='late from old DG', speaker='SPEAKER_0', is_user=True, start=1.5, end=2.5)
     stale.speaker = None
     stale.speaker_id = None
+    stale.stt_provider = 'deepgram:stale'
 
-    # BUG PATH: if stale segments reach combine_segments(conversation_tail, [stale]),
-    # the is_user merge predicate causes them to merge
-    merged, _, _ = TranscriptSegment.combine_segments(conversation_tail[:], [stale])
-    assert len(merged) == 1, "Bug: stale+tail merge via is_user path in combine_segments"
-    assert 'late from old DG' in merged[0].text, "Bug: stale text absorbed into tail"
-
-    # FIX PATH: stale segments passed via stale_segments parameter, appended after combine
-    fresh_combined, _, _ = TranscriptSegment.combine_segments(conversation_tail[:], [])  # no stale in segments
-    fresh_combined.extend([stale])  # append after, like _update_in_progress_conversation does
-    assert len(fresh_combined) == 2, f"Fix: stale segment must stay separate from tail, got {len(fresh_combined)}"
-    assert fresh_combined[0].text == 'hello world', "Original tail unchanged"
-    assert fresh_combined[1].speaker is None, "Stale segment keeps neutralized speaker"
-    assert fresh_combined[1].speaker_id is None, "Stale segment keeps neutralized speaker_id"
-
-    # Verify source: _update_in_progress_conversation handles stale_segments separately
-    source = _read_transcribe_source()
-    fn_pos = source.find('def _update_in_progress_conversation')
-    assert fn_pos > 0
-    fn_block = source[fn_pos : fn_pos + 1000]
-    # stale_segments appended after combine_segments, not passed to it
-    combine_pos = fn_block.find('combine_segments(')
-    extend_pos = fn_block.find('.extend(stale_segments)')
-    assert combine_pos > 0 and extend_pos > 0, "Both combine and stale extend must exist"
-    assert extend_pos > combine_pos, "Stale extend must come AFTER combine_segments"
+    # combine_segments blocks merge due to stt_provider mismatch
+    combined, _, _ = TranscriptSegment.combine_segments([tail], [stale])
+    assert len(combined) == 2, f"stt_provider barrier must prevent persisted-tail merge, got {len(combined)}"
+    assert combined[0].text == 'hello world', "Original tail unchanged"
+    assert combined[1].speaker is None, "Stale segment keeps neutralized speaker"
+    assert combined[1].stt_provider == 'deepgram:stale', "Stale provider preserved"
