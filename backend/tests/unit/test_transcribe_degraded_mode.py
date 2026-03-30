@@ -19,7 +19,6 @@ for mod_name in [
     'database._client',
     'database.users',
     'utils.other.storage',
-    'utils.stt.soniox_util',
     'deepgram',
     'deepgram.clients',
     'deepgram.clients.live',
@@ -78,15 +77,13 @@ def test_transcribe_emits_stt_degraded_status_event():
     assert 'status="stt_degraded"' in source
 
 
-def test_transcribe_has_deepgram_degraded_branch_before_1011_close():
+def test_transcribe_enters_degraded_mode_on_initial_processing_error():
     source = _read_transcribe_source()
     error_pos = source.find('logger.error(f"Initial processing error: {e} {uid} {session_id}")')
-    dg_branch = source.find("if stt_service == STTService.deepgram:", error_pos)
-    close_branch = source.find("await websocket.close(code=websocket_close_code)", error_pos)
+    degraded_pos = source.find('await _enter_degraded_mode(', error_pos)
     assert error_pos > 0
-    assert dg_branch > 0
-    assert close_branch > 0
-    assert dg_branch < close_branch
+    assert degraded_pos > 0
+    assert degraded_pos > error_pos
 
 
 def test_transcribe_attempts_recovery_after_degraded_mode_entry():
@@ -234,9 +231,9 @@ def test_vad_gate_activate_noop_when_already_active():
 
 
 def test_recovery_vad_activation_condition():
-    """The recovery path condition matches the profile-complete condition in flush_stt_buffer.
+    """The recovery path activates VAD gate from shadow mode after DG reconnect.
 
-    Both paths check: vad_gate is not None, mode is active/override, and gate is in shadow.
+    Checks: vad_gate is not None, mode is active/override, and gate is in shadow.
     """
     source = _read_transcribe_source()
 
@@ -244,18 +241,10 @@ def test_recovery_vad_activation_condition():
     recovery_pos = source.find('VAD gate activated after DG recovery')
     assert recovery_pos > 0, "Recovery path must have VAD gate activation"
 
-    # Find the profile-complete path's VAD activation
-    profile_pos = source.find('VAD gate activated after speech profile')
-    assert profile_pos > 0, "Profile-complete path must have VAD gate activation"
-
-    # Both should use the same condition pattern
+    # Verify the condition pattern
     recovery_block = source[recovery_pos - 300 : recovery_pos]
-    profile_block = source[profile_pos - 300 : profile_pos]
-
     assert "vad_gate.mode == 'shadow'" in recovery_block
-    assert "vad_gate.mode == 'shadow'" in profile_block
     assert "vad_gate.activate()" in recovery_block
-    assert "vad_gate.activate()" in profile_block
 
 
 # ---------------------------------------------------------------------------
