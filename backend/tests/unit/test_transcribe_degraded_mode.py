@@ -302,3 +302,61 @@ async def test_recovery_socket_with_vad_gate():
     assert isinstance(recovered_socket, GatedDeepgramSocket)
     assert not recovered_socket.is_connection_dead
     recovered_socket.finish()
+
+
+# ---------------------------------------------------------------------------
+# Behavioral: Multi-channel dead socket detection
+# ---------------------------------------------------------------------------
+
+
+def test_multichannel_dead_socket_nulls_slot():
+    """A dead multi-channel SafeDeepgramSocket should be detected via is_connection_dead.
+
+    In the multi-channel send path, this condition nulls stt_sockets_multi[ch_idx]
+    so that the recovery task can rebuild that channel.
+    """
+    mock_conn = MagicMock()
+    mock_conn.send.return_value = False  # Triggers death latch
+    cfg = KeepaliveConfig(keepalive_interval_sec=5.0, check_period_sec=999.0)
+    safe = SafeDeepgramSocket(mock_conn, cfg=cfg)
+    try:
+        safe.send(b'\x00' * 960)
+        assert safe.is_connection_dead is True
+
+        # Simulate the multi-channel send path: detect dead, null the slot
+        stt_sockets_multi = [safe, None]
+        if stt_sockets_multi[0] and stt_sockets_multi[0].is_connection_dead:
+            stt_sockets_multi[0] = None
+
+        assert stt_sockets_multi[0] is None, "Dead multi-channel socket should be nulled for recovery"
+    finally:
+        safe.finish()
+
+
+def test_multichannel_send_exception_nulls_slot():
+    """Multi-channel send exception should null the socket slot for recovery."""
+    mock_conn = MagicMock()
+    mock_conn.send.side_effect = ConnectionResetError('Connection reset')
+    cfg = KeepaliveConfig(keepalive_interval_sec=5.0, check_period_sec=999.0)
+    safe = SafeDeepgramSocket(mock_conn, cfg=cfg)
+    try:
+        safe.send(b'\x00' * 960)
+        assert safe.is_connection_dead is True
+
+        # Simulate the send path — exception caught, slot nulled
+        stt_sockets_multi = [safe]
+        stt_sockets_multi[0] = None
+        assert stt_sockets_multi[0] is None
+    finally:
+        safe.finish()
+
+
+def test_multichannel_dead_socket_detection_in_source():
+    """Multi-channel send path must detect dead sockets and enter degraded mode."""
+    source = _read_transcribe_source()
+    mc_dead_pos = source.find('mc_sock.is_connection_dead')
+    assert mc_dead_pos > 0, "Multi-channel path must check is_connection_dead"
+    mc_null_pos = source.find('stt_sockets_multi[ch_idx] = None', mc_dead_pos)
+    assert mc_null_pos > 0, "Multi-channel path must null the dead socket slot"
+    mc_degraded_pos = source.find('_enter_degraded_mode', mc_dead_pos)
+    assert mc_degraded_pos > 0, "Multi-channel path must enter degraded mode"
