@@ -41,7 +41,8 @@ if not hasattr(sys.modules['deepgram'], '_mock_initialized'):
 
 from utils.stt.streaming import connect_to_deepgram_with_backoff, process_audio_dg  # noqa: E402
 from utils.stt.streaming import deepgram_options, deepgram_cloud_options  # noqa: E402
-from utils.stt.streaming import get_deepgram_circuit_breaker  # noqa: E402
+from utils.stt.streaming import get_deepgram_circuit_breaker, calculate_backoff_with_jitter  # noqa: E402
+from utils.stt.streaming import DeepgramCircuitBreaker  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -1315,3 +1316,81 @@ def test_circuit_breaker_just_before_timeout_stays_open():
 
     assert cb.is_open() is True
     assert cb.allow_request() is False
+
+
+# ---------------------------------------------------------------------------
+# Boundary tests: backoff cap and constructor clamp
+# ---------------------------------------------------------------------------
+
+
+def test_backoff_capped_at_max_delay_for_large_attempt():
+    """calculate_backoff_with_jitter must not exceed max_delay even for very large attempt values."""
+    max_delay = 32000
+    for attempt in [10, 20, 50, 100]:
+        result = calculate_backoff_with_jitter(attempt, base_delay=1000, max_delay=max_delay)
+        assert result <= max_delay, f"attempt={attempt} produced {result} > max_delay={max_delay}"
+
+
+def test_backoff_zero_attempt_returns_small_value():
+    """Attempt 0 should return base_delay + jitter (at most 2x base_delay)."""
+    result = calculate_backoff_with_jitter(0, base_delay=1000, max_delay=32000)
+    assert 1000 <= result <= 2000
+
+
+def test_constructor_clamps_zero_threshold():
+    """failure_threshold=0 should be clamped to 1."""
+    cb = DeepgramCircuitBreaker(failure_threshold=0, reset_timeout_seconds=10.0)
+    assert cb.failure_threshold == 1
+
+
+def test_constructor_clamps_negative_threshold():
+    """failure_threshold=-5 should be clamped to 1."""
+    cb = DeepgramCircuitBreaker(failure_threshold=-5, reset_timeout_seconds=10.0)
+    assert cb.failure_threshold == 1
+
+
+def test_constructor_clamps_zero_timeout():
+    """reset_timeout_seconds=0 should be clamped to 1.0."""
+    cb = DeepgramCircuitBreaker(failure_threshold=3, reset_timeout_seconds=0)
+    assert cb.reset_timeout_seconds == 1.0
+
+
+def test_constructor_clamps_negative_timeout():
+    """reset_timeout_seconds=-10 should be clamped to 1.0."""
+    cb = DeepgramCircuitBreaker(failure_threshold=3, reset_timeout_seconds=-10)
+    assert cb.reset_timeout_seconds == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Behavioral: degraded event deduplication and single recovery task
+# ---------------------------------------------------------------------------
+
+
+def test_stt_degraded_event_deduplication_logic():
+    """_send_stt_degraded_event only sends once — verified by idempotent flag pattern in source."""
+    import os
+
+    transcribe_path = os.path.join(os.path.dirname(__file__), '..', '..', 'routers', 'transcribe.py')
+    with open(transcribe_path, encoding='utf-8') as f:
+        source = f.read()
+
+    # The flag check: if stt_degraded: return  — prevents duplicate sends
+    degraded_fn_pos = source.find('def _send_stt_degraded_event')
+    assert degraded_fn_pos > 0
+    guard_block = source[degraded_fn_pos : degraded_fn_pos + 200]
+    assert 'if stt_degraded:' in guard_block
+    assert 'return' in guard_block
+
+
+def test_recovery_task_single_spawn_logic():
+    """_enter_degraded_mode only spawns one recovery task — verified by done() check in source."""
+    import os
+
+    transcribe_path = os.path.join(os.path.dirname(__file__), '..', '..', 'routers', 'transcribe.py')
+    with open(transcribe_path, encoding='utf-8') as f:
+        source = f.read()
+
+    enter_fn_pos = source.find('async def _enter_degraded_mode')
+    assert enter_fn_pos > 0
+    fn_block = source[enter_fn_pos : enter_fn_pos + 500]
+    assert 'deepgram_recovery_task is None or deepgram_recovery_task.done()' in fn_block
