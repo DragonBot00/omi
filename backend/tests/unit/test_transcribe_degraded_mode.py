@@ -618,9 +618,10 @@ def test_multi_channel_callback_pins_epoch():
 def test_stale_segments_excluded_from_combine():
     """Source: stale segments must be separated from newly_processed_segments before combine_segments.
 
-    Stale segments are kept in a separate list (stale_dg_segments) and appended
-    AFTER combine_segments. This prevents ALL merge paths: same-speaker, is_user,
-    and lowercase-continuation. Speaker is also neutralized so speaker detection
+    Stale segments are kept in a separate list (stale_dg_segments) and passed separately
+    to _update_in_progress_conversation via the stale_segments parameter. This ensures they
+    bypass BOTH combine_segments calls (in stream_transcript_process AND in
+    _update_in_progress_conversation). Speaker is also neutralized so speaker detection
     naturally skips them.
     """
     source = _read_transcribe_source()
@@ -642,10 +643,20 @@ def test_stale_segments_excluded_from_combine():
     assert 'newly_processed_segments' in combine_line, "combine_segments must only receive fresh segments"
     assert 'stale_dg_segments' not in combine_line, "combine_segments must NOT receive stale segments"
 
-    # Stale segments must be appended AFTER combine_segments
-    extend_pos = process_block.find('transcript_segments.extend(stale_dg_segments)')
-    assert extend_pos > 0, "Stale segments must be appended after combine_segments"
-    assert extend_pos > combine_pos, "extend must come after combine_segments"
+    # Stale segments must be passed separately to _update_in_progress_conversation
+    assert (
+        'stale_segments=stale_dg_segments' in process_block
+    ), "Stale segments must be passed via stale_segments parameter to bypass both combine_segments calls"
+
+    # _update_in_progress_conversation must accept and handle stale_segments parameter
+    update_fn_pos = source.find('def _update_in_progress_conversation')
+    assert update_fn_pos > 0
+    update_fn_block = source[update_fn_pos : update_fn_pos + 1000]
+    assert 'stale_segments' in update_fn_block, "_update_in_progress_conversation must accept stale_segments parameter"
+    # Stale segments appended after combine_segments inside _update_in_progress_conversation
+    assert (
+        '.extend(stale_segments)' in update_fn_block
+    ), "Stale segments must be appended after combine in _update_in_progress_conversation"
 
 
 def test_stt_epoch_popped_before_transcript_segment():
@@ -810,3 +821,49 @@ def test_stale_segment_excluded_from_combine_prevents_all_merges():
     assert len(combined_fresh) == 2, f"Stale segment must stay separate, got {len(combined_fresh)}"
     assert combined_fresh[1].speaker is None, "Stale segment must keep neutralized speaker"
     assert combined_fresh[1].speaker_id is None, "Stale segment must keep neutralized speaker_id"
+
+
+def test_stale_segments_bypass_persisted_tail_combine():
+    """Regression: stale segments must also bypass combine_segments in _update_in_progress_conversation.
+
+    _update_in_progress_conversation calls combine_segments(conversation.transcript_segments, segments).
+    If stale segments are included in `segments`, they merge with the existing conversation tail
+    via the is_user path — even after being excluded from the first combine in stream_transcript_process.
+
+    The fix passes stale segments via a separate `stale_segments` parameter so they are appended
+    after both combine_segments calls.
+    """
+    from models.transcript_segment import TranscriptSegment
+
+    # Simulate existing conversation tail with is_user=True
+    conversation_tail = [TranscriptSegment(text='hello world', speaker='SPEAKER_0', is_user=True, start=0.0, end=1.0)]
+
+    # Stale segment: neutralized but would merge via is_user if fed to combine_segments
+    stale = TranscriptSegment(text='late from old DG', speaker='SPEAKER_0', is_user=True, start=1.5, end=2.5)
+    stale.speaker = None
+    stale.speaker_id = None
+
+    # BUG PATH: if stale segments reach combine_segments(conversation_tail, [stale]),
+    # the is_user merge predicate causes them to merge
+    merged, _, _ = TranscriptSegment.combine_segments(conversation_tail[:], [stale])
+    assert len(merged) == 1, "Bug: stale+tail merge via is_user path in combine_segments"
+    assert 'late from old DG' in merged[0].text, "Bug: stale text absorbed into tail"
+
+    # FIX PATH: stale segments passed via stale_segments parameter, appended after combine
+    fresh_combined, _, _ = TranscriptSegment.combine_segments(conversation_tail[:], [])  # no stale in segments
+    fresh_combined.extend([stale])  # append after, like _update_in_progress_conversation does
+    assert len(fresh_combined) == 2, f"Fix: stale segment must stay separate from tail, got {len(fresh_combined)}"
+    assert fresh_combined[0].text == 'hello world', "Original tail unchanged"
+    assert fresh_combined[1].speaker is None, "Stale segment keeps neutralized speaker"
+    assert fresh_combined[1].speaker_id is None, "Stale segment keeps neutralized speaker_id"
+
+    # Verify source: _update_in_progress_conversation handles stale_segments separately
+    source = _read_transcribe_source()
+    fn_pos = source.find('def _update_in_progress_conversation')
+    assert fn_pos > 0
+    fn_block = source[fn_pos : fn_pos + 1000]
+    # stale_segments appended after combine_segments, not passed to it
+    combine_pos = fn_block.find('combine_segments(')
+    extend_pos = fn_block.find('.extend(stale_segments)')
+    assert combine_pos > 0 and extend_pos > 0, "Both combine and stale extend must exist"
+    assert extend_pos > combine_pos, "Stale extend must come AFTER combine_segments"
