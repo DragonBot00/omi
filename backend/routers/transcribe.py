@@ -2349,12 +2349,15 @@ async def _stream_handler(
                     segments_to_process[i] = segment
 
                 newly_processed_segments = []
-                stale_dg_segment_ids = set()  # IDs of segments from a previous DG connection
                 for s in segments_to_process:
                     seg_epoch = s.pop('_stt_epoch', speaker_map_epoch)
                     segment = TranscriptSegment(**s, speech_profile_processed=True)
                     if seg_epoch != speaker_map_epoch:
-                        stale_dg_segment_ids.add(segment.id)
+                        # Neutralize speaker on stale segments so they can't pollute speaker maps
+                        # even if combine_segments merges them into an existing tail.
+                        # Text is preserved; only speaker matching is suppressed.
+                        segment.speaker = None
+                        segment.speaker_id = None
                     # In onboarding mode, force is_user=True for non-Omi segments (user's answers)
                     if onboarding_mode and s.get('speaker_id') != OnboardingHandler.OMI_SPEAKER_ID:
                         segment.is_user = True
@@ -2401,11 +2404,6 @@ async def _stream_handler(
                 # Speaker detection
                 for segment in updated_segments:
                     if segment.person_id or segment.is_user or segment.id in suggested_segments:
-                        continue
-
-                    # Skip speaker operations for segments from a previous DG connection —
-                    # their speaker_ids are from old diarization and would pollute the post-recovery map.
-                    if segment.id in stale_dg_segment_ids:
                         continue
 
                     # Session consistency speaker identification
