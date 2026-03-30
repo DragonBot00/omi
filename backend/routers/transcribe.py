@@ -1018,9 +1018,12 @@ async def _stream_handler(
         nonlocal deepgram_recovery_task
         attempt = 0
 
-        # Rotate stt_session once BEFORE any recovery attempts so recovered
+        # Single-channel: rotate stt_session BEFORE creating callback so recovered
         # segments carry a new session and can't merge with stale segments.
-        _reset_speaker_state_after_recovery()
+        # Multi-channel: skip reset — speaker labels are deterministic per channel,
+        # and healthy channels keep emitting segments with the old pinned session.
+        if not is_multi_channel:
+            _reset_speaker_state_after_recovery()
 
         while websocket_active:
             if is_multi_channel:
