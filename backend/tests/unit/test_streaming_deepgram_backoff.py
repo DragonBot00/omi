@@ -307,6 +307,40 @@ async def test_process_audio_dg_no_vad_wrap_on_none():
     assert result is None
 
 
+@pytest.mark.asyncio
+async def test_stale_session_does_not_wedge_half_open():
+    """A stale session (is_active=False) must not consume the half-open probe slot.
+
+    Regression: if allow_request() transitions CB from open→half_open before
+    is_active check, and the session aborts early, CB stays in half_open forever,
+    blocking all future reconnects on the pod.
+    """
+    cb = get_deepgram_circuit_breaker()
+    cb.failure_threshold = 1
+    cb.reset_timeout_seconds = 0.1
+    cb.record_failure(Exception("force open"))
+    import time as _time
+
+    _time.sleep(0.15)  # Wait for timeout
+
+    with patch('utils.stt.streaming.connect_to_deepgram') as mock_connect:
+        result = await connect_to_deepgram_with_backoff(
+            on_message=MagicMock(),
+            on_error=MagicMock(),
+            language='en',
+            sample_rate=16000,
+            channels=1,
+            model='nova-2-general',
+            retries=1,
+            is_active=lambda: False,
+        )
+
+    assert result is None
+    mock_connect.assert_not_called()
+    # CB must NOT be in half_open — it should still be open or closed
+    assert cb._state != "half_open", f"CB wedged in half_open: {cb.snapshot()}"
+
+
 def test_deepgram_options_no_keepalive():
     """SDK keepalive option must not be present — it spawns a dangerous background thread (#5870)."""
     for name, opts in [('deepgram_options', deepgram_options), ('deepgram_cloud_options', deepgram_cloud_options)]:
