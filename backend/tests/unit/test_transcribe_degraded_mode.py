@@ -619,6 +619,33 @@ def test_multi_channel_callback_pins_epoch():
     assert "stt_session" in fn_block, "multi-channel callback must tag segments with stt_session"
 
 
+def test_recovery_resets_session_before_callback_creation():
+    """Source: _recover_deepgram_connection must call _reset_speaker_state_after_recovery()
+    BEFORE creating any callbacks, so recovered segments carry the new stt_session.
+
+    Regression: if reset happens after callback creation, the recovered callback pins
+    the old session and segments merge with stale data / are skipped by speaker guard.
+    """
+    source = _read_transcribe_source()
+    fn_pos = source.find('async def _recover_deepgram_connection')
+    assert fn_pos > 0
+    fn_block = source[fn_pos : fn_pos + 3000]
+
+    # Reset must appear before any callback creation
+    reset_pos = fn_block.find('_reset_speaker_state_after_recovery()')
+    assert reset_pos > 0, "Recovery must call _reset_speaker_state_after_recovery"
+
+    # Single-channel callback creation must come after reset
+    single_cb_pos = fn_block.find('_make_dg_transcript_callback()')
+    if single_cb_pos > 0:
+        assert reset_pos < single_cb_pos, "Reset must come before single-channel callback creation"
+
+    # Multi-channel callback creation must come after reset
+    multi_cb_pos = fn_block.find('make_multi_channel_callback(')
+    if multi_cb_pos > 0:
+        assert reset_pos < multi_cb_pos, "Reset must come before multi-channel callback creation"
+
+
 def test_stale_segments_excluded_from_combine():
     """Source: stt_session field on TranscriptSegment acts as a merge barrier in combine_segments.
 
