@@ -31,11 +31,13 @@ for mod_name in [
         _mock_modules[mod_name] = MagicMock()
         sys.modules[mod_name] = _mock_modules[mod_name]
 
-# Provide expected attributes for type-annotation imports
-sys.modules['deepgram'].DeepgramClient = MagicMock
-sys.modules['deepgram'].DeepgramClientOptions = MagicMock
-sys.modules['deepgram'].LiveTranscriptionEvents = MagicMock()
-sys.modules['deepgram.clients.live.v1'].LiveOptions = MagicMock
+# Only set attributes if not already set by another test file (avoids cross-test contamination)
+if not hasattr(sys.modules['deepgram'], '_mock_initialized'):
+    sys.modules['deepgram'].DeepgramClient = MagicMock
+    sys.modules['deepgram'].DeepgramClientOptions = MagicMock
+    sys.modules['deepgram'].LiveTranscriptionEvents = MagicMock()
+    sys.modules['deepgram.clients.live.v1'].LiveOptions = MagicMock
+    sys.modules['deepgram']._mock_initialized = True
 
 from utils.stt.streaming import connect_to_deepgram_with_backoff, process_audio_dg  # noqa: E402
 from utils.stt.streaming import deepgram_options, deepgram_cloud_options  # noqa: E402
