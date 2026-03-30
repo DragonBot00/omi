@@ -1018,6 +1018,10 @@ async def _stream_handler(
         nonlocal deepgram_recovery_task
         attempt = 0
 
+        # Rotate stt_session once BEFORE any recovery attempts so recovered
+        # segments carry a new session and can't merge with stale segments.
+        _reset_speaker_state_after_recovery()
+
         while websocket_active:
             if is_multi_channel:
                 missing_indices = [i for i, sock in enumerate(stt_sockets_multi) if sock is None]
@@ -1069,8 +1073,6 @@ async def _stream_handler(
                         ):
                             vad_gate.activate()
                             logger.info('VAD gate activated after DG recovery uid=%s session=%s', uid, session_id)
-                        # New DG connection resets diarization — clear stale speaker mappings
-                        _reset_speaker_state_after_recovery()
                         logger.info(f"Recovered Deepgram socket {uid} {session_id}")
                         _send_stt_recovered_event()
                         return
