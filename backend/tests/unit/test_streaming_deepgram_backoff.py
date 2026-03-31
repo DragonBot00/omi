@@ -1465,7 +1465,7 @@ def test_recovery_task_single_spawn_while_pending():
     source = _read_transcribe_source()
     fn_pos = source.find('async def _enter_degraded_mode')
     assert fn_pos > 0
-    fn_block = source[fn_pos : fn_pos + 800]
+    fn_block = source[fn_pos : fn_pos + 1000]
     assert 'deepgram_recovery_task is None or deepgram_recovery_task.done()' in fn_block
 
     spawn_calls = []
