@@ -67,6 +67,7 @@ pytest tests/unit/test_timeout_middleware.py -v
 pytest tests/unit/test_pusher_circuit_breaker.py -v
 pytest tests/unit/test_lock_bypass_fixes.py -v
 pytest tests/unit/test_transcribe_degraded_mode.py -v
+pytest tests/unit/test_degraded_batch_transcription.py -v
 pytest tests/unit/test_dev_api_lock_bypass.py -v
 pytest tests/unit/test_rate_limiting.py -v
 pytest tests/unit/test_transcribe_degraded_mode.py -v
