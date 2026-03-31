@@ -72,7 +72,7 @@ from utils.other import endpoints as auth
 from utils.other.storage import get_profile_audio_if_exists, get_user_has_speech_profile
 from utils.pusher import connect_to_trigger_pusher, PusherCircuitBreakerOpen, get_circuit_breaker, CircuitState
 from utils.speaker_identification import detect_speaker_from_text
-from utils.stt.pre_recorded import deepgram_prerecorded_from_bytes, postprocess_words
+from utils.stt.degraded_batch import DegradedBatchProcessor, BATCH_INTERVAL_SECONDS as DEGRADED_BATCH_INTERVAL_SECONDS
 from utils.stt.streaming import (
     STTService,
     calculate_backoff_with_jitter,
@@ -931,9 +931,7 @@ async def _stream_handler(
     stt_degraded = False
 
     # Degraded batch transcription — buffer PCM and flush to pre-recorded API every 30s
-    DEGRADED_BATCH_INTERVAL_SECONDS = 30
-    degraded_audio_buffer: bytearray = bytearray()
-    degraded_audio_start_time: Optional[float] = None  # wall-clock when first byte entered buffer
+    degraded_batch_processor = DegradedBatchProcessor(sample_rate=sample_rate, uid=uid, session_id=session_id)
     degraded_batch_task: Optional[asyncio.Task] = None
 
     vad_gate = None
@@ -986,122 +984,23 @@ async def _stream_handler(
             return
         stt_degraded = False
         # Flush any remaining degraded audio asynchronously before declaring recovery
-        if degraded_audio_buffer and not is_multi_channel:
+        if degraded_batch_processor.has_audio and not is_multi_channel:
             spawn(_flush_degraded_batch())
         _send_message_event(MessageServiceStatusEvent(status="stt_recovered", status_text="STT Service Restored"))
 
-    def _build_wav_bytes(pcm_data: bytes, wav_sample_rate: int, channels: int = 1, bits_per_sample: int = 16) -> bytes:
-        """Wrap raw PCM data in a WAV container for pre-recorded API."""
-        data_size = len(pcm_data)
-        byte_rate = wav_sample_rate * channels * bits_per_sample // 8
-        block_align = channels * bits_per_sample // 8
-        header = struct.pack(
-            '<4sI4s4sIHHIIHH4sI',
-            b'RIFF',
-            36 + data_size,
-            b'WAVE',
-            b'fmt ',
-            16,
-            1,  # PCM format
-            channels,
-            wav_sample_rate,
-            byte_rate,
-            block_align,
-            bits_per_sample,
-            b'data',
-            data_size,
-        )
-        return header + pcm_data
+    def _degraded_flush_kwargs():
+        """Build keyword args for DegradedBatchProcessor.flush() from current session state."""
+        return {
+            'stream_start_time': first_audio_byte_timestamp,
+            'segment_sink': realtime_segment_buffers,
+            'budget_exhausted': fair_use_dg_budget_exhausted,
+            'track_usage': fair_use_track_dg_usage,
+        }
 
     async def _flush_degraded_batch():
-        """Flush accumulated degraded audio to pre-recorded API and feed segments into pipeline."""
-        nonlocal degraded_audio_buffer, degraded_audio_start_time
-
-        if not degraded_audio_buffer or degraded_audio_start_time is None:
-            return
         if first_audio_byte_timestamp is None:
             return
-
-        # Atomic detach — new audio goes into a fresh buffer
-        pcm_chunk = bytes(degraded_audio_buffer)
-        batch_start = degraded_audio_start_time
-        degraded_audio_buffer = bytearray()
-        degraded_audio_start_time = None
-
-        # Budget parity: honor DG budget exhaustion (#6083)
-        if fair_use_dg_budget_exhausted:
-            logger.info('Degraded batch skipped: DG budget exhausted uid=%s session=%s', uid, session_id)
-            del pcm_chunk
-            return
-
-        # Build WAV container
-        wav_data = _build_wav_bytes(pcm_chunk, sample_rate)
-        duration_s = len(pcm_chunk) / (sample_rate * 2)  # 16-bit mono
-        del pcm_chunk  # Free raw PCM immediately
-
-        # Offset: seconds from stream start to when this batch's audio began arriving
-        batch_offset = batch_start - first_audio_byte_timestamp
-        batch_session = str(ULID())
-
-        try:
-            words = await asyncio.to_thread(
-                deepgram_prerecorded_from_bytes,
-                wav_data,
-                sample_rate,
-                True,  # diarize
-            )
-            del wav_data
-
-            if not words:
-                logger.info('Degraded batch: no words returned uid=%s session=%s', uid, session_id)
-                return
-
-            segments = postprocess_words(words, int(duration_s))
-            del words
-
-            # Convert TranscriptSegment objects to dicts matching streaming pipeline format.
-            # postprocess_words rebases start/end to 0 — add batch_offset to align with stream timeline.
-            segment_dicts = []
-            for seg in segments:
-                segment_dicts.append(
-                    {
-                        'start': round(seg.start + batch_offset, 2),
-                        'end': round(seg.end + batch_offset, 2),
-                        'speaker': seg.speaker,
-                        'text': seg.text,
-                        'is_user': seg.is_user,
-                        'person_id': None,
-                        'stt_session': batch_session,
-                    }
-                )
-
-            if segment_dicts:
-                realtime_segment_buffers.extend(segment_dicts)
-                # Track DG usage for batch call
-                if fair_use_track_dg_usage:
-                    batch_ms = int(duration_s * 1000)
-                    try:
-                        await asyncio.to_thread(record_dg_usage_ms, uid, batch_ms)
-                    except Exception:
-                        pass  # Non-critical
-                logger.info(
-                    'Degraded batch: %d segments, offset=%.1fs, duration=%.1fs, session=%s uid=%s',
-                    len(segment_dicts),
-                    batch_offset,
-                    duration_s,
-                    batch_session[:8],
-                    uid,
-                )
-        except Exception as e:
-            logger.error('Degraded batch transcription failed: %s uid=%s session=%s', e, uid, session_id)
-
-    async def _degraded_batch_timer():
-        """Periodic task that flushes degraded audio buffer every DEGRADED_BATCH_INTERVAL_SECONDS."""
-        while websocket_active and stt_degraded:
-            await asyncio.sleep(DEGRADED_BATCH_INTERVAL_SECONDS)
-            if not stt_degraded or not websocket_active:
-                break
-            await _flush_degraded_batch()
+        await degraded_batch_processor.flush(**_degraded_flush_kwargs())
 
     def _reset_speaker_state_after_recovery():
         """Reset DG-diarization-dependent speaker state after socket recovery.
@@ -1221,7 +1120,12 @@ async def _stream_handler(
 
         # Start degraded batch transcription timer (single-channel only)
         if not is_multi_channel and (degraded_batch_task is None or degraded_batch_task.done()):
-            degraded_batch_task = spawn(_degraded_batch_timer())
+            degraded_batch_task = spawn(
+                degraded_batch_processor.run_timer(
+                    is_active=lambda: websocket_active and stt_degraded,
+                    flush_kwargs=_degraded_flush_kwargs,
+                )
+            )
 
         if deepgram_recovery_task is None or deepgram_recovery_task.done():
             deepgram_recovery_task = spawn(_recover_deepgram_connection())
@@ -2729,7 +2633,7 @@ async def _stream_handler(
 
         async def flush_stt_buffer(force: bool = False):
             nonlocal stt_audio_buffer, dg_usage_ms_pending, dg_socket, deepgram_socket
-            nonlocal degraded_audio_buffer, degraded_audio_start_time
+            # degraded_batch_processor handles buffer state internally
 
             if not stt_audio_buffer:
                 return
@@ -2776,9 +2680,7 @@ async def _stream_handler(
                         await _enter_degraded_mode("STT degraded: DG send failed")
                         # Route this chunk to degraded batch buffer (#6052)
                         if stt_degraded and not is_multi_channel and not fair_use_dg_budget_exhausted:
-                            if degraded_audio_start_time is None:
-                                degraded_audio_start_time = time.time()
-                            degraded_audio_buffer.extend(chunk)
+                            degraded_batch_processor.feed(chunk)
                         return
                     # Accumulate DG usage locally, flushed every 60s (#5854)
                     if fair_use_track_dg_usage:
@@ -2788,9 +2690,7 @@ async def _stream_handler(
                 # DG socket unavailable — route audio to degraded batch buffer (#6052)
                 # Single-channel only; multi-channel batch loses per-channel speaker attribution
                 if stt_degraded and not is_multi_channel and not fair_use_dg_budget_exhausted:
-                    if degraded_audio_start_time is None:
-                        degraded_audio_start_time = time.time()
-                    degraded_audio_buffer.extend(chunk)
+                    degraded_batch_processor.feed(chunk)
 
         try:
             while websocket_active:
@@ -3024,7 +2924,7 @@ async def _stream_handler(
             if not use_custom_stt:
                 await flush_stt_buffer(force=True)
             # Flush any remaining degraded batch audio before disconnect (#6052)
-            if degraded_audio_buffer and not is_multi_channel:
+            if degraded_batch_processor.has_audio and not is_multi_channel:
                 await _flush_degraded_batch()
             websocket_active = False
 
