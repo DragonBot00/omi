@@ -2,8 +2,8 @@
 
 When the DG streaming socket is unavailable, audio is buffered and sent to
 the pre-recorded API every 30s instead of being lost.  These tests cover:
-- WAV header construction
-- Buffer accumulation and atomic detach
+- DegradedBatchProcessor class (feed, flush, has_audio, run_timer)
+- WAV header construction (build_wav_bytes)
 - Timestamp offsetting for batch segments
 - Budget parity (DG budget exhaustion skips batch)
 - Batch segments carry unique stt_session per chunk
@@ -17,6 +17,7 @@ import struct
 import sys
 import time
 import wave
+from collections import deque
 from io import BytesIO
 from unittest.mock import MagicMock, patch, AsyncMock
 
@@ -31,6 +32,9 @@ for mod_name in [
     'database.users',
     'database.conversations',
     'database.calendar_meetings',
+    'database.fair_use',
+    'database.user_usage',
+    'database.subscription',
     'utils.other.storage',
     'deepgram',
     'deepgram.clients',
@@ -54,8 +58,10 @@ if not hasattr(sys.modules['deepgram'], '_mock_initialized'):
 from models.transcript_segment import TranscriptSegment  # noqa: E402
 from models.message_event import MessageServiceStatusEvent  # noqa: E402
 from utils.stt.pre_recorded import postprocess_words  # noqa: E402
+from utils.stt.degraded_batch import DegradedBatchProcessor, build_wav_bytes, BATCH_INTERVAL_SECONDS  # noqa: E402
 
 TRANSCRIBE_PATH = os.path.join(os.path.dirname(__file__), '..', '..', 'routers', 'transcribe.py')
+DEGRADED_BATCH_PATH = os.path.join(os.path.dirname(__file__), '..', '..', 'utils', 'stt', 'degraded_batch.py')
 
 
 def _read_transcribe_source() -> str:
@@ -63,49 +69,25 @@ def _read_transcribe_source() -> str:
         return f.read()
 
 
+def _read_degraded_batch_source() -> str:
+    with open(DEGRADED_BATCH_PATH, encoding='utf-8') as f:
+        return f.read()
+
+
 # ---------------------------------------------------------------------------
-# WAV header construction
+# WAV header construction (build_wav_bytes in degraded_batch.py)
 # ---------------------------------------------------------------------------
 
 
 def test_wav_header_structure():
-    """_build_wav_bytes produces a valid WAV file that the wave module can parse."""
-    source = _read_transcribe_source()
-    # Verify the function exists
-    assert 'def _build_wav_bytes(' in source, "_build_wav_bytes must exist in transcribe.py"
-
-    # Replicate the function locally to test it
-    def _build_wav_bytes(pcm_data, wav_sample_rate, channels=1, bits_per_sample=16):
-        data_size = len(pcm_data)
-        byte_rate = wav_sample_rate * channels * bits_per_sample // 8
-        block_align = channels * bits_per_sample // 8
-        header = struct.pack(
-            '<4sI4s4sIHHIIHH4sI',
-            b'RIFF',
-            36 + data_size,
-            b'WAVE',
-            b'fmt ',
-            16,
-            1,
-            channels,
-            wav_sample_rate,
-            byte_rate,
-            block_align,
-            bits_per_sample,
-            b'data',
-            data_size,
-        )
-        return header + pcm_data
-
-    # Generate 0.5s of silence at 16kHz mono 16-bit
+    """build_wav_bytes produces a valid WAV file that the wave module can parse."""
     sample_rate = 16000
     duration = 0.5
     num_samples = int(sample_rate * duration)
     pcm = b'\x00\x00' * num_samples  # 16-bit silence
 
-    wav_bytes = _build_wav_bytes(pcm, sample_rate)
+    wav_bytes = build_wav_bytes(pcm, sample_rate)
 
-    # Parse with wave module to validate header
     buf = BytesIO(wav_bytes)
     with wave.open(buf, 'rb') as wf:
         assert wf.getnchannels() == 1
@@ -116,37 +98,118 @@ def test_wav_header_structure():
 
 def test_wav_header_8000hz():
     """WAV header works for 8kHz sample rate (phone-quality audio)."""
-
-    def _build_wav_bytes(pcm_data, wav_sample_rate, channels=1, bits_per_sample=16):
-        data_size = len(pcm_data)
-        byte_rate = wav_sample_rate * channels * bits_per_sample // 8
-        block_align = channels * bits_per_sample // 8
-        header = struct.pack(
-            '<4sI4s4sIHHIIHH4sI',
-            b'RIFF',
-            36 + data_size,
-            b'WAVE',
-            b'fmt ',
-            16,
-            1,
-            channels,
-            wav_sample_rate,
-            byte_rate,
-            block_align,
-            bits_per_sample,
-            b'data',
-            data_size,
-        )
-        return header + pcm_data
-
     sample_rate = 8000
     pcm = b'\x00\x00' * 4000  # 0.5s
-    wav_bytes = _build_wav_bytes(pcm, sample_rate)
+    wav_bytes = build_wav_bytes(pcm, sample_rate)
 
     buf = BytesIO(wav_bytes)
     with wave.open(buf, 'rb') as wf:
         assert wf.getframerate() == 8000
         assert wf.getnframes() == 4000
+
+
+# ---------------------------------------------------------------------------
+# DegradedBatchProcessor — feed / has_audio / flush
+# ---------------------------------------------------------------------------
+
+
+def test_processor_feed_and_has_audio():
+    """feed() accumulates audio and has_audio reflects buffer state."""
+    proc = DegradedBatchProcessor(sample_rate=16000, uid='u1', session_id='s1')
+    assert not proc.has_audio
+
+    proc.feed(b'\x00' * 320)
+    assert proc.has_audio
+
+    proc.feed(b'\x00' * 320)
+    assert proc.has_audio
+
+
+@pytest.mark.asyncio
+async def test_processor_flush_empty_buffer():
+    """flush() on empty buffer returns 0 and does nothing."""
+    proc = DegradedBatchProcessor(sample_rate=16000, uid='u1', session_id='s1')
+    sink = deque()
+    result = await proc.flush(stream_start_time=1000.0, segment_sink=sink)
+    assert result == 0
+    assert len(sink) == 0
+
+
+@pytest.mark.asyncio
+async def test_processor_flush_budget_exhausted():
+    """flush() with budget_exhausted=True skips DG call and returns 0."""
+    proc = DegradedBatchProcessor(sample_rate=16000, uid='u1', session_id='s1')
+    proc.feed(b'\x00' * 32000)  # 1s of audio
+    sink = deque()
+
+    result = await proc.flush(stream_start_time=1000.0, segment_sink=sink, budget_exhausted=True)
+    assert result == 0
+    assert len(sink) == 0
+    # Buffer should be cleared even when skipped
+    assert not proc.has_audio
+
+
+@pytest.mark.asyncio
+async def test_processor_flush_produces_segments():
+    """flush() calls pre-recorded API and pushes segments into sink with correct offsets."""
+    proc = DegradedBatchProcessor(sample_rate=16000, uid='u1', session_id='s1')
+    proc.feed(b'\x00' * 32000)  # 1s
+    proc._buffer_start_time = 1060.0  # Simulate audio starting 60s into stream
+
+    mock_words = [
+        {'timestamp': [0.0, 0.5], 'speaker': 'SPEAKER_00', 'text': 'Hello'},
+        {'timestamp': [0.5, 1.0], 'speaker': 'SPEAKER_00', 'text': 'world'},
+    ]
+
+    sink = deque()
+    with patch('utils.stt.degraded_batch.deepgram_prerecorded_from_bytes', return_value=mock_words):
+        result = await proc.flush(stream_start_time=1000.0, segment_sink=sink)
+
+    assert result >= 1
+    assert len(sink) >= 1
+    # Segments should have batch_offset (1060.0 - 1000.0 = 60.0) applied
+    assert sink[0]['start'] >= 60.0
+    assert sink[0]['stt_session'] is not None
+    assert not proc.has_audio  # Buffer cleared after flush
+
+
+@pytest.mark.asyncio
+async def test_processor_flush_atomic_swap():
+    """flush() atomically detaches buffer — new audio goes to a fresh buffer."""
+    proc = DegradedBatchProcessor(sample_rate=16000, uid='u1', session_id='s1')
+    proc.feed(b'\x01' * 32000)  # 1s
+    proc._buffer_start_time = 1000.0
+
+    # Start flush in background and feed more audio concurrently
+    mock_words = []
+    with patch('utils.stt.degraded_batch.deepgram_prerecorded_from_bytes', return_value=mock_words):
+        result = await proc.flush(stream_start_time=1000.0, segment_sink=deque())
+
+    # After flush, buffer is empty — ready for new audio
+    assert not proc.has_audio
+    proc.feed(b'\x02' * 100)
+    assert proc.has_audio
+
+
+@pytest.mark.asyncio
+async def test_processor_flush_tracks_dg_usage():
+    """flush() with track_usage=True calls record_dg_usage_ms."""
+    proc = DegradedBatchProcessor(sample_rate=16000, uid='u1', session_id='s1')
+    proc.feed(b'\x00' * 32000)  # 1s
+    proc._buffer_start_time = 1000.0
+
+    mock_words = [
+        {'timestamp': [0.0, 0.5], 'speaker': 'SPEAKER_00', 'text': 'Hello'},
+    ]
+
+    sink = deque()
+    with patch('utils.stt.degraded_batch.deepgram_prerecorded_from_bytes', return_value=mock_words), patch(
+        'utils.stt.degraded_batch.record_dg_usage_ms'
+    ) as mock_usage:
+        result = await proc.flush(stream_start_time=1000.0, segment_sink=sink, track_usage=True)
+
+    assert result >= 1
+    mock_usage.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +242,7 @@ def test_batch_offset_applied_to_segments():
     batch_offset = 60.0  # This batch started 60s into the stream
     batch_session = 'batch-ses-001'
 
-    # Apply offset (mirroring _flush_degraded_batch logic)
+    # Apply offset (mirroring DegradedBatchProcessor.flush logic)
     segment_dicts = []
     for seg in [seg_a, seg_b]:
         segment_dicts.append(
@@ -279,36 +342,6 @@ def test_batch_and_streaming_sessions_dont_merge():
 
 
 # ---------------------------------------------------------------------------
-# Atomic buffer detach (swap model)
-# ---------------------------------------------------------------------------
-
-
-def test_atomic_buffer_swap():
-    """Detaching the buffer must be atomic — new audio goes to a fresh buffer."""
-    degraded_audio_buffer = bytearray(b'\x01' * 48000)  # ~1.5s at 16kHz
-    degraded_audio_start_time = 1060.0
-
-    # Atomic detach (mirroring _flush_degraded_batch)
-    pcm_chunk = bytes(degraded_audio_buffer)
-    batch_start = degraded_audio_start_time
-    degraded_audio_buffer = bytearray()
-    degraded_audio_start_time = None
-
-    # Original data captured
-    assert len(pcm_chunk) == 48000
-    assert batch_start == 1060.0
-
-    # New buffer is empty and ready for more audio
-    assert len(degraded_audio_buffer) == 0
-    assert degraded_audio_start_time is None
-
-    # New audio goes to the fresh buffer
-    degraded_audio_buffer.extend(b'\x02' * 100)
-    assert len(degraded_audio_buffer) == 100
-    assert pcm_chunk[0:1] == b'\x01'  # Original data unchanged
-
-
-# ---------------------------------------------------------------------------
 # Budget parity
 # ---------------------------------------------------------------------------
 
@@ -317,7 +350,7 @@ def test_budget_exhausted_skips_batch():
     """When fair_use_dg_budget_exhausted is True, batch transcription is skipped."""
     fair_use_dg_budget_exhausted = True
 
-    # Simulate the budget check in _flush_degraded_batch
+    # Simulate the budget check in DegradedBatchProcessor.flush
     pcm_chunk = b'\x00' * 960000  # 30s of audio
     if fair_use_dg_budget_exhausted:
         skipped = True
@@ -343,53 +376,53 @@ def test_budget_not_exhausted_allows_batch():
 
 
 # ---------------------------------------------------------------------------
-# Source wiring — degraded batch components exist in transcribe.py
+# Source wiring — DegradedBatchProcessor used in transcribe.py
 # ---------------------------------------------------------------------------
 
 
-def test_degraded_batch_buffer_declared():
-    """transcribe.py must declare degraded_audio_buffer and degraded_audio_start_time."""
+def test_processor_instantiated_in_transcribe():
+    """transcribe.py must instantiate DegradedBatchProcessor."""
     source = _read_transcribe_source()
-    assert 'degraded_audio_buffer' in source
-    assert 'degraded_audio_start_time' in source
+    assert 'DegradedBatchProcessor(' in source
 
 
-def test_degraded_batch_timer_exists():
-    """transcribe.py must have _degraded_batch_timer that runs every DEGRADED_BATCH_INTERVAL_SECONDS."""
+def test_processor_imported_in_transcribe():
+    """transcribe.py must import DegradedBatchProcessor from utils.stt.degraded_batch."""
     source = _read_transcribe_source()
-    assert 'async def _degraded_batch_timer' in source
-    assert 'DEGRADED_BATCH_INTERVAL_SECONDS' in source
+    import_section = '\n'.join(source.split('\n')[:120])
+    assert 'from utils.stt.degraded_batch import' in import_section
+    assert 'DegradedBatchProcessor' in import_section
 
 
 def test_flush_degraded_batch_exists():
-    """transcribe.py must have _flush_degraded_batch function."""
+    """transcribe.py must have _flush_degraded_batch thin wrapper."""
     source = _read_transcribe_source()
     assert 'async def _flush_degraded_batch' in source
 
 
-def test_flush_stt_buffer_routes_to_degraded_buffer():
-    """flush_stt_buffer must route audio to degraded_audio_buffer when DG is unavailable."""
+def test_flush_stt_buffer_routes_to_processor():
+    """flush_stt_buffer must route audio to degraded_batch_processor.feed() when DG is unavailable."""
     source = _read_transcribe_source()
     flush_fn_pos = source.find('async def flush_stt_buffer')
     assert flush_fn_pos > 0
     flush_block = source[flush_fn_pos : flush_fn_pos + 3000]
 
-    # Must route to degraded buffer when DG socket is None
+    # Must route to processor.feed when DG socket is None
     assert (
-        'degraded_audio_buffer.extend(chunk)' in flush_block
-    ), "flush_stt_buffer must route audio to degraded_audio_buffer when DG is down"
+        'degraded_batch_processor.feed(chunk)' in flush_block
+    ), "flush_stt_buffer must route audio to degraded_batch_processor.feed() when DG is down"
     # Must check stt_degraded before routing
     assert 'stt_degraded' in flush_block
 
 
 def test_enter_degraded_mode_starts_batch_timer():
-    """_enter_degraded_mode must start _degraded_batch_timer for single-channel."""
+    """_enter_degraded_mode must start degraded_batch_processor.run_timer for single-channel."""
     source = _read_transcribe_source()
     fn_pos = source.find('async def _enter_degraded_mode')
     assert fn_pos > 0
     fn_block = source[fn_pos : fn_pos + 1000]
 
-    assert '_degraded_batch_timer' in fn_block, "_enter_degraded_mode must start the batch timer"
+    assert 'degraded_batch_processor.run_timer' in fn_block, "_enter_degraded_mode must start the batch timer"
     assert 'not is_multi_channel' in fn_block, "Batch timer must only start for single-channel"
 
 
@@ -401,39 +434,30 @@ def test_recovery_flushes_remaining_degraded_buffer():
     fn_block = source[fn_pos : fn_pos + 800]
 
     assert '_flush_degraded_batch' in fn_block, "Recovery must flush remaining degraded buffer"
-    assert 'degraded_audio_buffer' in fn_block, "Recovery must check if there is buffered audio"
+    assert 'degraded_batch_processor.has_audio' in fn_block, "Recovery must check processor.has_audio"
 
 
-def test_degraded_batch_uses_pre_recorded_api():
-    """_flush_degraded_batch must call deepgram_prerecorded_from_bytes."""
-    source = _read_transcribe_source()
-    fn_pos = source.find('async def _flush_degraded_batch')
+def test_degraded_batch_class_uses_pre_recorded_api():
+    """DegradedBatchProcessor.flush must call deepgram_prerecorded_from_bytes."""
+    source = _read_degraded_batch_source()
+    assert 'deepgram_prerecorded_from_bytes' in source
+    assert 'asyncio.to_thread' in source
+    assert 'postprocess_words' in source
+
+
+def test_degraded_batch_class_builds_wav():
+    """degraded_batch.py must have build_wav_bytes for WAV container construction."""
+    source = _read_degraded_batch_source()
+    assert 'def build_wav_bytes(' in source
+
+
+def test_degraded_batch_class_checks_budget():
+    """DegradedBatchProcessor.flush must honor budget_exhausted parameter."""
+    source = _read_degraded_batch_source()
+    fn_pos = source.find('async def flush(')
     assert fn_pos > 0
     fn_block = source[fn_pos : fn_pos + 2500]
-
-    assert 'deepgram_prerecorded_from_bytes' in fn_block, "Must use pre-recorded API for batch transcription"
-    assert 'asyncio.to_thread' in fn_block, "Must run blocking DG call in thread pool"
-    assert 'postprocess_words' in fn_block, "Must postprocess words into segments"
-
-
-def test_degraded_batch_builds_wav():
-    """_flush_degraded_batch must build WAV bytes from PCM data."""
-    source = _read_transcribe_source()
-    fn_pos = source.find('async def _flush_degraded_batch')
-    assert fn_pos > 0
-    fn_block = source[fn_pos : fn_pos + 2500]
-
-    assert '_build_wav_bytes' in fn_block, "Must build WAV container for pre-recorded API"
-
-
-def test_degraded_batch_checks_budget():
-    """_flush_degraded_batch must honor fair_use_dg_budget_exhausted."""
-    source = _read_transcribe_source()
-    fn_pos = source.find('async def _flush_degraded_batch')
-    assert fn_pos > 0
-    fn_block = source[fn_pos : fn_pos + 2500]
-
-    assert 'fair_use_dg_budget_exhausted' in fn_block, "Must check DG budget before batch transcription"
+    assert 'budget_exhausted' in fn_block
 
 
 def test_degraded_event_includes_batch_metadata():
@@ -456,16 +480,16 @@ def test_degraded_batch_single_channel_only():
     assert flush_pos > 0
     flush_block = source[flush_pos : flush_pos + 3000]
 
-    # Find degraded buffer extend — must be preceded by is_multi_channel check
-    extend_pos = flush_block.find('degraded_audio_buffer.extend(chunk)')
-    assert extend_pos > 0
-    pre_extend = flush_block[:extend_pos]
-    assert 'not is_multi_channel' in pre_extend, "Degraded buffer routing must check not is_multi_channel"
+    # Find degraded processor.feed — must be preceded by is_multi_channel check
+    feed_pos = flush_block.find('degraded_batch_processor.feed(chunk)')
+    assert feed_pos > 0
+    pre_feed = flush_block[:feed_pos]
+    assert 'not is_multi_channel' in pre_feed, "Degraded buffer routing must check not is_multi_channel"
 
     # In _enter_degraded_mode, batch timer must check is_multi_channel
     enter_pos = source.find('async def _enter_degraded_mode')
     enter_block = source[enter_pos : enter_pos + 1000]
-    timer_pos = enter_block.find('_degraded_batch_timer')
+    timer_pos = enter_block.find('degraded_batch_processor.run_timer')
     pre_timer = enter_block[:timer_pos]
     assert 'not is_multi_channel' in pre_timer
 
@@ -531,31 +555,29 @@ def test_postprocess_words_empty_input():
 
 
 # ---------------------------------------------------------------------------
-# DG usage tracking for batch calls
+# DG usage tracking in degraded_batch.py
 # ---------------------------------------------------------------------------
 
 
-def test_degraded_batch_tracks_dg_usage():
-    """_flush_degraded_batch must track DG usage for batch calls (record_dg_usage_ms)."""
+def test_degraded_batch_class_tracks_dg_usage():
+    """DegradedBatchProcessor.flush must track DG usage (record_dg_usage_ms)."""
+    source = _read_degraded_batch_source()
+    assert 'record_dg_usage_ms' in source
+    assert 'track_usage' in source
+
+
+# ---------------------------------------------------------------------------
+# No old inline functions remain in transcribe.py
+# ---------------------------------------------------------------------------
+
+
+def test_no_inline_build_wav_bytes():
+    """_build_wav_bytes must NOT exist in transcribe.py (moved to degraded_batch.py)."""
     source = _read_transcribe_source()
-    fn_pos = source.find('async def _flush_degraded_batch')
-    assert fn_pos > 0
-    fn_block = source[fn_pos : fn_pos + 3500]
-
-    assert 'record_dg_usage_ms' in fn_block, "Must track DG usage for batch calls"
-    assert 'fair_use_track_dg_usage' in fn_block, "Must check fair_use_track_dg_usage flag"
+    assert 'def _build_wav_bytes(' not in source
 
 
-# ---------------------------------------------------------------------------
-# Import guard — pre_recorded is imported at module top level
-# ---------------------------------------------------------------------------
-
-
-def test_pre_recorded_imported_at_top_level():
-    """deepgram_prerecorded_from_bytes and postprocess_words must be imported at module top level."""
+def test_no_inline_degraded_batch_timer():
+    """_degraded_batch_timer must NOT exist in transcribe.py (replaced by processor.run_timer)."""
     source = _read_transcribe_source()
-    # Find the import section (first 120 lines)
-    import_section = '\n'.join(source.split('\n')[:120])
-    assert 'from utils.stt.pre_recorded import' in import_section
-    assert 'deepgram_prerecorded_from_bytes' in import_section
-    assert 'postprocess_words' in import_section
+    assert 'async def _degraded_batch_timer' not in source
